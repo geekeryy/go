@@ -1072,6 +1072,7 @@ type EncodeQueryTest struct {
 
 var encodeQueryTests = []EncodeQueryTest{
 	{nil, ""},
+	{Values{}, ""},
 	{Values{"q": {"puppies"}, "oe": {"utf8"}}, "oe=utf8&q=puppies"},
 	{Values{"q": {"dogs", "&", "7"}}, "q=dogs&q=%26&q=7"},
 	{Values{
@@ -1116,7 +1117,6 @@ func TestResolvePath(t *testing.T) {
 }
 
 func BenchmarkResolvePath(b *testing.B) {
-	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		resolvePath("a/b/c", ".././d")
@@ -1248,6 +1248,14 @@ var resolveReferenceTests = []struct {
 
 	// Empty path and query but with ForceQuery (issue 46033).
 	{"https://a/b/c/d;p?q#s", "?", "https://a/b/c/d;p?"},
+
+	// Opaque URLs (issue 66084).
+	{"https://foo.com/bar?a=b", "http:opaque", "http:opaque"},
+	{"http:opaque?x=y#zzz", "https:/foo?a=b#frag", "https:/foo?a=b#frag"},
+	{"http:opaque?x=y#zzz", "https:foo:bar", "https:foo:bar"},
+	{"http:opaque?x=y#zzz", "https:bar/baz?a=b#frag", "https:bar/baz?a=b#frag"},
+	{"http:opaque?x=y#zzz", "https://user@host:1234?a=b#frag", "https://user@host:1234?a=b#frag"},
+	{"http:opaque?x=y#zzz", "?a=b#frag", "http:opaque?a=b#frag"},
 }
 
 func TestResolveReference(t *testing.T) {
@@ -1858,6 +1866,7 @@ func TestURLHostnameAndPort(t *testing.T) {
 
 var _ encodingPkg.BinaryMarshaler = (*URL)(nil)
 var _ encodingPkg.BinaryUnmarshaler = (*URL)(nil)
+var _ encodingPkg.BinaryAppender = (*URL)(nil)
 
 func TestJSON(t *testing.T) {
 	u, err := Parse("https://www.google.com/x?y=z")
@@ -2082,6 +2091,26 @@ func TestJoinPath(t *testing.T) {
 		},
 		{
 			base: "https://go.googlesource.com/",
+			elem: []string{"../go"},
+			out:  "https://go.googlesource.com/go",
+		},
+		{
+			base: "https://go.googlesource.com",
+			elem: []string{"../go"},
+			out:  "https://go.googlesource.com/go",
+		},
+		{
+			base: "https://go.googlesource.com",
+			elem: []string{"../go", "../../go", "../../../go"},
+			out:  "https://go.googlesource.com/go",
+		},
+		{
+			base: "https://go.googlesource.com/../go",
+			elem: nil,
+			out:  "https://go.googlesource.com/go",
+		},
+		{
+			base: "https://go.googlesource.com/",
 			elem: []string{"./go"},
 			out:  "https://go.googlesource.com/go",
 		},
@@ -2112,7 +2141,7 @@ func TestJoinPath(t *testing.T) {
 		{
 			base: "https://go.googlesource.com",
 			elem: nil,
-			out:  "https://go.googlesource.com",
+			out:  "https://go.googlesource.com/",
 		},
 		{
 			base: "https://go.googlesource.com/",
@@ -2120,9 +2149,54 @@ func TestJoinPath(t *testing.T) {
 			out:  "https://go.googlesource.com/",
 		},
 		{
+			base: "https://go.googlesource.com/a%2fb",
+			elem: []string{"c"},
+			out:  "https://go.googlesource.com/a%2fb/c",
+		},
+		{
+			base: "https://go.googlesource.com/a%2fb",
+			elem: []string{"c%2fd"},
+			out:  "https://go.googlesource.com/a%2fb/c%2fd",
+		},
+		{
+			base: "https://go.googlesource.com/a/b",
+			elem: []string{"/go"},
+			out:  "https://go.googlesource.com/a/b/go",
+		},
+		{
 			base: "/",
 			elem: nil,
 			out:  "/",
+		},
+		{
+			base: "a",
+			elem: nil,
+			out:  "a",
+		},
+		{
+			base: "a",
+			elem: []string{"b"},
+			out:  "a/b",
+		},
+		{
+			base: "a",
+			elem: []string{"../b"},
+			out:  "b",
+		},
+		{
+			base: "a",
+			elem: []string{"../../b"},
+			out:  "b",
+		},
+		{
+			base: "",
+			elem: []string{"a"},
+			out:  "a",
+		},
+		{
+			base: "",
+			elem: []string{"../a"},
+			out:  "a",
 		},
 	}
 	for _, tt := range tests {

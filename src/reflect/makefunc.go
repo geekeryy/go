@@ -22,7 +22,7 @@ type makeFuncImpl struct {
 	fn   func([]Value) []Value
 }
 
-// MakeFunc returns a new function of the given Type
+// MakeFunc returns a new function of the given [Type]
 // that wraps the function fn. When called, that new function
 // does the following:
 //
@@ -30,14 +30,14 @@ type makeFuncImpl struct {
 //   - runs results := fn(args).
 //   - returns the results as a slice of Values, one per formal result.
 //
-// The implementation fn can assume that the argument Value slice
+// The implementation fn can assume that the argument [Value] slice
 // has the number and type of arguments given by typ.
 // If typ describes a variadic function, the final Value is itself
 // a slice representing the variadic arguments, as in the
 // body of a variadic function. The result Value slice returned by fn
 // must have the number and type of results given by typ.
 //
-// The Value.Call method allows the caller to invoke a typed function
+// The [Value.Call] method allows the caller to invoke a typed function
 // in terms of Values; in contrast, MakeFunc allows the caller to implement
 // a typed function in terms of Values.
 //
@@ -100,8 +100,8 @@ func makeMethodValue(op string, v Value) Value {
 
 	// Ignoring the flagMethod bit, v describes the receiver, not the method type.
 	fl := v.flag & (flagRO | flagAddr | flagIndir)
-	fl |= flag(v.typ.Kind())
-	rcvr := Value{v.typ, v.ptr, fl}
+	fl |= flag(v.typ().Kind())
+	rcvr := Value{v.typ(), v.ptr, fl}
 
 	// v.Type returns the actual type of the method value.
 	ftyp := (*funcType)(unsafe.Pointer(v.Type().(*rtype)))
@@ -126,7 +126,7 @@ func makeMethodValue(op string, v Value) Value {
 	// but we want Interface() and other operations to fail early.
 	methodReceiver(op, fv.rcvr, fv.method)
 
-	return Value{&ftyp.rtype, unsafe.Pointer(fv), v.flag&flagRO | flag(Func)}
+	return Value{ftyp.Common(), unsafe.Pointer(fv), v.flag&flagRO | flag(Func)}
 }
 
 func methodValueCallCodePtr() uintptr {

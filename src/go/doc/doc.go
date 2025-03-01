@@ -76,7 +76,7 @@ type Func struct {
 
 	// methods
 	// (for functions, these fields have the respective zero value)
-	Recv  string // actual   receiver "T" or "*T"
+	Recv  string // actual   receiver "T" or "*T" possibly followed by type parameters [P1, ..., Pn]
 	Orig  string // original receiver "T" or "*T"
 	Level int    // embedding level; 0 means not embedded
 
@@ -96,7 +96,7 @@ type Note struct {
 	Body     string    // note body text
 }
 
-// Mode values control the operation of New and NewFromFiles.
+// Mode values control the operation of [New] and [NewFromFiles].
 type Mode int
 
 const (
@@ -116,7 +116,7 @@ const (
 
 // New computes the package documentation for the given package AST.
 // New takes ownership of the AST pkg and may edit or overwrite it.
-// To have the Examples fields populated, use NewFromFiles and include
+// To have the [Examples] fields populated, use [NewFromFiles] and include
 // the package's _test.go files.
 func New(pkg *ast.Package, importPath string, mode Mode) *Package {
 	var r reader
@@ -173,7 +173,11 @@ func (p *Package) collectTypes(types []*Type) {
 func (p *Package) collectFuncs(funcs []*Func) {
 	for _, f := range funcs {
 		if f.Recv != "" {
-			p.syms[strings.TrimPrefix(f.Recv, "*")+"."+f.Name] = true
+			r := strings.TrimPrefix(f.Recv, "*")
+			if i := strings.IndexByte(r, '['); i >= 0 {
+				r = r[:i] // remove type parameters
+			}
+			p.syms[r+"."+f.Name] = true
 		} else {
 			p.syms[f.Name] = true
 		}
@@ -194,9 +198,9 @@ func (p *Package) collectFuncs(funcs []*Func) {
 // Examples found in _test.go files are associated with the corresponding
 // type, function, method, or the package, based on their name.
 // If the example has a suffix in its name, it is set in the
-// Example.Suffix field. Examples with malformed names are skipped.
+// [Example.Suffix] field. [Examples] with malformed names are skipped.
 //
-// Optionally, a single extra argument of type Mode can be provided to
+// Optionally, a single extra argument of type [Mode] can be provided to
 // control low-level aspects of the documentation extraction behavior.
 //
 // NewFromFiles takes ownership of the AST files and may edit them,

@@ -8,7 +8,7 @@ package runtime
 
 import (
 	"internal/abi"
-	"runtime/internal/atomic"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -28,7 +28,7 @@ var (
 )
 
 func selectsetpc(pc *uintptr) {
-	*pc = getcallerpc()
+	*pc = sys.GetCallerPC()
 }
 
 func sellock(scases []scase, lockorder []uint16) {
@@ -70,7 +70,7 @@ func selparkcommit(gp *g, _ unsafe.Pointer) bool {
 	// Mark that it's safe for stack shrinking to occur now,
 	// because any thread acquiring this G's stack for shrinking
 	// is guaranteed to observe activeStackChans after this store.
-	atomic.Store8(&gp.parkingOnChan, 0)
+	gp.parkingOnChan.Store(false)
 	// Make sure we unlock after setting activeStackChans and
 	// unsetting parkingOnChan. The moment we unlock any of the
 	// channel locks we risk gp getting readied by a channel operation
@@ -101,7 +101,7 @@ func selparkcommit(gp *g, _ unsafe.Pointer) bool {
 }
 
 func block() {
-	gopark(nil, nil, waitReasonSelectNoCases, traceEvGoStop, 1) // forever
+	gopark(nil, nil, waitReasonSelectNoCases, traceBlockForever, 1) // forever
 }
 
 // selectgo implements the select statement.
@@ -120,6 +120,7 @@ func block() {
 // Also, if the chosen scase was a receive operation, it reports whether
 // a value was received.
 func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, block bool) (int, bool) {
+	gp := getg()
 	if debugSelect {
 		print("select: cas0=", cas0, "\n")
 	}
@@ -165,6 +166,7 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 
 	// generate permuted order
 	norder := 0
+	allSynctest := true
 	for i := range scases {
 		cas := &scases[i]
 
@@ -174,13 +176,32 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 			continue
 		}
 
-		j := fastrandn(uint32(norder + 1))
+		if cas.c.synctest {
+			if getg().syncGroup == nil {
+				panic(plainError("select on synctest channel from outside bubble"))
+			}
+		} else {
+			allSynctest = false
+		}
+
+		if cas.c.timer != nil {
+			cas.c.timer.maybeRunChan()
+		}
+
+		j := cheaprandn(uint32(norder + 1))
 		pollorder[norder] = pollorder[j]
 		pollorder[j] = uint16(i)
 		norder++
 	}
 	pollorder = pollorder[:norder]
 	lockorder = lockorder[:norder]
+
+	waitReason := waitReasonSelect
+	if gp.syncGroup != nil && allSynctest {
+		// Every channel selected on is in a synctest bubble,
+		// so this goroutine will count as idle while selecting.
+		waitReason = waitReasonSynctestSelect
+	}
 
 	// sort the cases by Hchan address to get the locking order.
 	// simple heap sort, to guarantee n log n time and constant stack footprint.
@@ -231,7 +252,6 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	sellock(scases, lockorder)
 
 	var (
-		gp     *g
 		sg     *sudog
 		c      *hchan
 		k      *scase
@@ -287,7 +307,6 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	}
 
 	// pass 2 - enqueue on all chans
-	gp = getg()
 	if gp.waiting != nil {
 		throw("gp.waiting != nil")
 	}
@@ -316,6 +335,10 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 		} else {
 			c.recvq.enqueue(sg)
 		}
+
+		if c.timer != nil {
+			blockTimerChan(c)
+		}
 	}
 
 	// wait for someone to wake us up
@@ -324,13 +347,13 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	// to park on a channel. The window between when this G's status
 	// changes and when we set gp.activeStackChans is not safe for
 	// stack shrinking.
-	atomic.Store8(&gp.parkingOnChan, 1)
-	gopark(selparkcommit, nil, waitReasonSelect, traceEvGoBlockSelect, 1)
+	gp.parkingOnChan.Store(true)
+	gopark(selparkcommit, nil, waitReason, traceBlockSelect, 1)
 	gp.activeStackChans = false
 
 	sellock(scases, lockorder)
 
-	gp.selectDone = 0
+	gp.selectDone.Store(0)
 	sg = (*sudog)(gp.param)
 	gp.param = nil
 
@@ -352,6 +375,9 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 
 	for _, casei := range lockorder {
 		k = &scases[casei]
+		if k.c.timer != nil {
+			unblockTimerChan(k.c)
+		}
 		if sg == sglist {
 			// sg has already been dequeued by the G that woke us up.
 			casi = int(casei)
@@ -401,16 +427,16 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	}
 	if msanenabled {
 		if casi < nsends {
-			msanread(cas.elem, c.elemtype.size)
+			msanread(cas.elem, c.elemtype.Size_)
 		} else if cas.elem != nil {
-			msanwrite(cas.elem, c.elemtype.size)
+			msanwrite(cas.elem, c.elemtype.Size_)
 		}
 	}
 	if asanenabled {
 		if casi < nsends {
-			asanread(cas.elem, c.elemtype.size)
+			asanread(cas.elem, c.elemtype.Size_)
 		} else if cas.elem != nil {
-			asanwrite(cas.elem, c.elemtype.size)
+			asanwrite(cas.elem, c.elemtype.Size_)
 		}
 	}
 
@@ -426,10 +452,10 @@ bufrecv:
 		racenotify(c, c.recvx, nil)
 	}
 	if msanenabled && cas.elem != nil {
-		msanwrite(cas.elem, c.elemtype.size)
+		msanwrite(cas.elem, c.elemtype.Size_)
 	}
 	if asanenabled && cas.elem != nil {
-		asanwrite(cas.elem, c.elemtype.size)
+		asanwrite(cas.elem, c.elemtype.Size_)
 	}
 	recvOK = true
 	qp = chanbuf(c, c.recvx)
@@ -452,10 +478,10 @@ bufsend:
 		raceReadObjectPC(c.elemtype, cas.elem, casePC(casi), chansendpc)
 	}
 	if msanenabled {
-		msanread(cas.elem, c.elemtype.size)
+		msanread(cas.elem, c.elemtype.Size_)
 	}
 	if asanenabled {
-		asanread(cas.elem, c.elemtype.size)
+		asanread(cas.elem, c.elemtype.Size_)
 	}
 	typedmemmove(c.elemtype, chanbuf(c, c.sendx), cas.elem)
 	c.sendx++
@@ -493,10 +519,10 @@ send:
 		raceReadObjectPC(c.elemtype, cas.elem, casePC(casi), chansendpc)
 	}
 	if msanenabled {
-		msanread(cas.elem, c.elemtype.size)
+		msanread(cas.elem, c.elemtype.Size_)
 	}
 	if asanenabled {
-		asanread(cas.elem, c.elemtype.size)
+		asanread(cas.elem, c.elemtype.Size_)
 	}
 	send(c, sg, cas.elem, func() { selunlock(scases, lockorder) }, 2)
 	if debugSelect {

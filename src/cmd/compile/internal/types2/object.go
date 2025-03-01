@@ -9,13 +9,20 @@ import (
 	"cmd/compile/internal/syntax"
 	"fmt"
 	"go/constant"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 )
 
-// An Object describes a named language entity such as a package,
-// constant, type, variable, function (incl. methods), or label.
-// All objects implement the Object interface.
+// An Object is a named language entity.
+// An Object may be a constant ([Const]), type name ([TypeName]),
+// variable or struct field ([Var]), function or method ([Func]),
+// imported package ([PkgName]), label ([Label]),
+// built-in function ([Builtin]),
+// or the predeclared identifier 'nil' ([Nil]).
+//
+// The environment, which is structured as a tree of Scopes,
+// maps each name to the unique Object that it denotes.
 type Object interface {
 	Parent() *Scope  // scope in which this object is declared; nil for methods and struct fields
 	Pos() syntax.Pos // position of object identifier in declaration
@@ -26,6 +33,7 @@ type Object interface {
 	Id() string      // object name if exported, qualified name if not exported (see func Id)
 
 	// String returns a human-readable string of the object.
+	// Use [ObjectString] to control how package names are formatted in the string.
 	String() string
 
 	// order reflects a package-level object's source order: if object
@@ -50,7 +58,9 @@ type Object interface {
 	setParent(*Scope)
 
 	// sameId reports whether obj.Id() and Id(pkg, name) are the same.
-	sameId(pkg *Package, name string) bool
+	// If foldCase is true, names are considered equal if they are equal with case folding
+	// and their packages are ignored (e.g., pkg1.m, pkg1.M, pkg2.m, and pkg2.M are all equal).
+	sameId(pkg *Package, name string, foldCase bool) bool
 
 	// scopePos returns the start position of the scope of this Object
 	scopePos() syntax.Pos
@@ -163,65 +173,68 @@ func (obj *object) setOrder(order uint32)      { assert(order > 0); obj.order_ =
 func (obj *object) setColor(color color)       { assert(color != white); obj.color_ = color }
 func (obj *object) setScopePos(pos syntax.Pos) { obj.scopePos_ = pos }
 
-func (obj *object) sameId(pkg *Package, name string) bool {
+func (obj *object) sameId(pkg *Package, name string, foldCase bool) bool {
+	// If we don't care about capitalization, we also ignore packages.
+	if foldCase && strings.EqualFold(obj.name, name) {
+		return true
+	}
 	// spec:
 	// "Two identifiers are different if they are spelled differently,
 	// or if they appear in different packages and are not exported.
 	// Otherwise, they are the same."
-	if name != obj.name {
+	if obj.name != name {
 		return false
 	}
 	// obj.Name == name
 	if obj.Exported() {
 		return true
 	}
-	// not exported, so packages must be the same (pkg == nil for
-	// fields in Universe scope; this can only happen for types
-	// introduced via Eval)
-	if pkg == nil || obj.pkg == nil {
-		return pkg == obj.pkg
-	}
-	// pkg != nil && obj.pkg != nil
-	return pkg.path == obj.pkg.path
+	// not exported, so packages must be the same
+	return samePkg(obj.pkg, pkg)
 }
 
-// less reports whether object a is ordered before object b.
+// cmp reports whether object a is ordered before object b.
+// cmp returns:
+//
+//	-1 if a is before b
+//	 0 if a is equivalent to b
+//	+1 if a is behind b
 //
 // Objects are ordered nil before non-nil, exported before
 // non-exported, then by name, and finally (for non-exported
-// functions) by package height and path.
-func (a *object) less(b *object) bool {
+// functions) by package path.
+func (a *object) cmp(b *object) int {
 	if a == b {
-		return false
+		return 0
 	}
 
 	// Nil before non-nil.
 	if a == nil {
-		return true
+		return -1
 	}
 	if b == nil {
-		return false
+		return +1
 	}
 
 	// Exported functions before non-exported.
 	ea := isExported(a.name)
 	eb := isExported(b.name)
 	if ea != eb {
-		return ea
+		if ea {
+			return -1
+		}
+		return +1
 	}
 
 	// Order by name and then (for non-exported names) by package.
 	if a.name != b.name {
-		return a.name < b.name
+		return strings.Compare(a.name, b.name)
 	}
 	if !ea {
-		if a.pkg.height != b.pkg.height {
-			return a.pkg.height < b.pkg.height
-		}
-		return a.pkg.path < b.pkg.path
+		return strings.Compare(a.pkg.path, b.pkg.path)
 	}
 
-	return false
+	return 0
 }
 
 // A PkgName represents an imported Go package.
@@ -259,7 +272,11 @@ func (obj *Const) Val() constant.Value { return obj.val }
 
 func (*Const) isDependency() {} // a constant may be a dependency of an initialization expression
 
-// A TypeName represents a name for a (defined or alias) type.
+// A TypeName is an [Object] that represents a type with a name:
+// a defined type ([Named]),
+// an alias type ([Alias]),
+// a type parameter ([TypeParam]),
+// or a predeclared type such as int or error.
 type TypeName struct {
 	object
 }
@@ -279,19 +296,7 @@ func NewTypeName(pos syntax.Pos, pkg *Package, name string, typ Type) *TypeName 
 // lazily calls resolve to finish constructing the Named object.
 func NewTypeNameLazy(pos syntax.Pos, pkg *Package, name string, load func(named *Named) (tparams []*TypeParam, underlying Type, methods []*Func)) *TypeName {
 	obj := NewTypeName(pos, pkg, name, nil)
-
-	resolve := func(_ *Context, t *Named) (*TypeParamList, Type, *methodList) {
-		tparams, underlying, methods := load(t)
-
-		switch underlying.(type) {
-		case nil, *Named:
-			panic(fmt.Sprintf("invalid underlying type %T", t.underlying))
-		}
-
-		return bindTParams(tparams), underlying, newMethodList(methods)
-	}
-
-	NewNamed(obj, nil, nil).resolver = resolve
+	NewNamed(obj, nil, nil).loader = load
 	return obj
 }
 
@@ -300,6 +305,8 @@ func (obj *TypeName) IsAlias() bool {
 	switch t := obj.typ.(type) {
 	case nil:
 		return false
+	// case *Alias:
+	//	handled by default case
 	case *Basic:
 		// unsafe.Pointer is not an alias.
 		if obj.pkg == Unsafe {
@@ -327,6 +334,7 @@ type Var struct {
 	embedded bool // if set, the variable is an embedded struct field, and name is the type name
 	isField  bool // var is struct field
 	used     bool // set if the variable was used
+	origin   *Var // if non-nil, the Var from which this one was instantiated
 }
 
 // NewVar returns a new variable.
@@ -357,6 +365,20 @@ func (obj *Var) Embedded() bool { return obj.embedded }
 // IsField reports whether the variable is a struct field.
 func (obj *Var) IsField() bool { return obj.isField }
 
+// Origin returns the canonical Var for its receiver, i.e. the Var object
+// recorded in Info.Defs.
+//
+// For synthetic Vars created during instantiation (such as struct fields or
+// function parameters that depend on type arguments), this will be the
+// corresponding Var on the generic (uninstantiated) type. For all other Vars
+// Origin returns the receiver.
+func (obj *Var) Origin() *Var {
+	if obj.origin != nil {
+		return obj.origin
+	}
+	return obj
+}
+
 func (*Var) isDependency() {} // a variable may be a dependency of an initialization expression
 
 // A Func represents a declared function, concrete method, or abstract
@@ -364,18 +386,39 @@ func (*Var) isDependency() {} // a variable may be a dependency of an initializa
 // An abstract method may belong to many interfaces due to embedding.
 type Func struct {
 	object
-	hasPtrRecv_ bool // only valid for methods that don't have a type yet; use hasPtrRecv() to read
+	hasPtrRecv_ bool  // only valid for methods that don't have a type yet; use hasPtrRecv() to read
+	origin      *Func // if non-nil, the Func from which this one was instantiated
 }
 
 // NewFunc returns a new function with the given signature, representing
 // the function's type.
 func NewFunc(pos syntax.Pos, pkg *Package, name string, sig *Signature) *Func {
-	// don't store a (typed) nil signature
 	var typ Type
 	if sig != nil {
 		typ = sig
+	} else {
+		// Don't store a (typed) nil *Signature.
+		// We can't simply replace it with new(Signature) either,
+		// as this would violate object.{Type,color} invariants.
+		// TODO(adonovan): propose to disallow NewFunc with nil *Signature.
 	}
-	return &Func{object{nil, pos, pkg, name, typ, 0, colorFor(typ), nopos}, false}
+	return &Func{object{nil, pos, pkg, name, typ, 0, colorFor(typ), nopos}, false, nil}
+}
+
+// Signature returns the signature (type) of the function or method.
+func (obj *Func) Signature() *Signature {
+	if obj.typ != nil {
+		return obj.typ.(*Signature) // normal case
+	}
+	// No signature: Signature was called either:
+	// - within go/types, before a FuncDecl's initially
+	//   nil Func.Type was lazily populated, indicating
+	//   a types bug; or
+	// - by a client after NewFunc(..., nil),
+	//   which is arguably a client bug, but we need a
+	//   proposal to tighten NewFunc's precondition.
+	// For now, return a trivial signature.
+	return new(Signature)
 }
 
 // FullName returns the package- or receiver-type-qualified name of
@@ -390,6 +433,26 @@ func (obj *Func) FullName() string {
 // The result is nil for imported or instantiated functions and methods
 // (but there is also no mechanism to get to an instantiated function).
 func (obj *Func) Scope() *Scope { return obj.typ.(*Signature).scope }
+
+// Origin returns the canonical Func for its receiver, i.e. the Func object
+// recorded in Info.Defs.
+//
+// For synthetic functions created during instantiation (such as methods on an
+// instantiated Named type or interface methods that depend on type arguments),
+// this will be the corresponding Func on the generic (uninstantiated) type.
+// For all other Funcs Origin returns the receiver.
+func (obj *Func) Origin() *Func {
+	if obj.origin != nil {
+		return obj.origin
+	}
+	return obj
+}
+
+// Pkg returns the package to which the function belongs.
+//
+// The result is nil for methods of types in the Universe scope,
+// like method Error of the error built-in interface type.
+func (obj *Func) Pkg() *Package { return obj.object.Pkg() }
 
 // hasPtrRecv reports whether the receiver is of the form *T for the given method obj.
 func (obj *Func) hasPtrRecv() bool {
@@ -497,7 +560,7 @@ func writeObject(buf *bytes.Buffer, obj Object, qf Qualifier) {
 
 	// For package-level objects, qualify the name.
 	if obj.Pkg() != nil && obj.Pkg().scope.Lookup(obj.Name()) == obj {
-		writePackage(buf, obj.Pkg(), qf)
+		buf.WriteString(packagePrefix(obj.Pkg(), qf))
 	}
 	buf.WriteString(obj.Name())
 
@@ -511,17 +574,21 @@ func writeObject(buf *bytes.Buffer, obj Object, qf Qualifier) {
 			// Don't print anything more for basic types since there's
 			// no more information.
 			return
-		case *Named:
+		case genericType:
 			if t.TypeParams().Len() > 0 {
 				newTypeWriter(buf, qf).tParamList(t.TypeParams().list())
 			}
 		}
 		if tname.IsAlias() {
 			buf.WriteString(" =")
+			if alias, ok := typ.(*Alias); ok { // materialized? (gotypesalias=1)
+				typ = alias.fromRHS
+			}
 		} else if t, _ := typ.(*TypeParam); t != nil {
 			typ = t.bound
 		} else {
 			// TODO(gri) should this be fromRHS for *Named?
+			// (See discussion in #66559.)
 			typ = under(typ)
 		}
 	}
@@ -529,7 +596,7 @@ func writeObject(buf *bytes.Buffer, obj Object, qf Qualifier) {
 	// Special handling for any: because WriteType will format 'any' as 'any',
 	// resulting in the object string `type any = any` rather than `type any =
 	// interface{}`. To avoid this, swap in a different empty interface.
-	if obj == universeAny {
+	if obj.Name() == "any" && obj.Parent() == Universe {
 		assert(Identical(typ, &emptyInterface))
 		typ = &emptyInterface
 	}
@@ -538,9 +605,9 @@ func writeObject(buf *bytes.Buffer, obj Object, qf Qualifier) {
 	WriteType(buf, typ, qf)
 }
 
-func writePackage(buf *bytes.Buffer, pkg *Package, qf Qualifier) {
+func packagePrefix(pkg *Package, qf Qualifier) string {
 	if pkg == nil {
-		return
+		return ""
 	}
 	var s string
 	if qf != nil {
@@ -549,9 +616,9 @@ func writePackage(buf *bytes.Buffer, pkg *Package, qf Qualifier) {
 		s = pkg.Path()
 	}
 	if s != "" {
-		buf.WriteString(s)
-		buf.WriteByte('.')
+		s += "."
 	}
+	return s
 }
 
 // ObjectString returns the string form of obj.
@@ -589,7 +656,7 @@ func writeFuncName(buf *bytes.Buffer, f *Func, qf Qualifier) {
 			buf.WriteByte(')')
 			buf.WriteByte('.')
 		} else if f.pkg != nil {
-			writePackage(buf, f.pkg, qf)
+			buf.WriteString(packagePrefix(f.pkg, qf))
 		}
 	}
 	buf.WriteString(f.name)

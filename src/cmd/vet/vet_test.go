@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package main_test
+package main
 
 import (
 	"bytes"
@@ -17,67 +17,36 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 )
 
-const dataDir = "testdata"
-
-var binary string
-
-// We implement TestMain so remove the test binary when all is done.
+// TestMain executes the test binary as the vet command if
+// GO_VETTEST_IS_VET is set, and runs the tests otherwise.
 func TestMain(m *testing.M) {
-	os.Exit(testMain(m))
+	if os.Getenv("GO_VETTEST_IS_VET") != "" {
+		main()
+		os.Exit(0)
+	}
+
+	os.Setenv("GO_VETTEST_IS_VET", "1") // Set for subprocesses to inherit.
+	os.Exit(m.Run())
 }
 
-func testMain(m *testing.M) int {
-	dir, err := os.MkdirTemp("", "vet_test")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer os.RemoveAll(dir)
-	binary = filepath.Join(dir, "testvet.exe")
-
-	return m.Run()
-}
-
-var (
-	buildMu sync.Mutex // guards following
-	built   = false    // We have built the binary.
-	failed  = false    // We have failed to build the binary, don't try again.
-)
-
-func Build(t *testing.T) {
-	buildMu.Lock()
-	defer buildMu.Unlock()
-	if built {
-		return
-	}
-	if failed {
-		t.Skip("cannot run on this environment")
-	}
-	testenv.MustHaveGoBuild(t)
-	cmd := exec.Command(testenv.GoToolPath(t), "build", "-o", binary)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		failed = true
-		fmt.Fprintf(os.Stderr, "%s\n", output)
-		t.Fatal(err)
-	}
-	built = true
+// vetPath returns the path to the "vet" binary to run.
+func vetPath(t testing.TB) string {
+	return testenv.Executable(t)
 }
 
 func vetCmd(t *testing.T, arg, pkg string) *exec.Cmd {
-	cmd := exec.Command(testenv.GoToolPath(t), "vet", "-vettool="+binary, arg, path.Join("cmd/vet/testdata", pkg))
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "vet", "-vettool="+vetPath(t), arg, path.Join("cmd/vet/testdata", pkg))
 	cmd.Env = os.Environ()
 	return cmd
 }
 
 func TestVet(t *testing.T) {
 	t.Parallel()
-	Build(t)
 	for _, pkg := range []string{
+		"appends",
 		"asm",
 		"assign",
 		"atomic",
@@ -87,13 +56,14 @@ func TestVet(t *testing.T) {
 		"composite",
 		"copylock",
 		"deadcode",
+		"directive",
 		"httpresponse",
 		"lostcancel",
 		"method",
 		"nilfunc",
 		"print",
-		"rangeloop",
 		"shift",
+		"slog",
 		"structtag",
 		"testingpkg",
 		// "testtag" has its own test
@@ -133,6 +103,70 @@ func TestVet(t *testing.T) {
 			errchk(cmd, files, t)
 		})
 	}
+
+	// The loopclosure analyzer (aka "rangeloop" before CL 140578)
+	// is a no-op for files whose version >= go1.22, so we use a
+	// go.mod file in the rangeloop directory to "downgrade".
+	//
+	// TODO(adonovan): delete when go1.21 goes away.
+	t.Run("loopclosure", func(t *testing.T) {
+		cmd := testenv.Command(t, testenv.GoToolPath(t), "vet", "-vettool="+vetPath(t), ".")
+		cmd.Env = append(os.Environ(), "GOWORK=off")
+		cmd.Dir = "testdata/rangeloop"
+		cmd.Stderr = new(strings.Builder) // all vet output goes to stderr
+		cmd.Run()
+		stderr := cmd.Stderr.(fmt.Stringer).String()
+
+		filename := filepath.FromSlash("testdata/rangeloop/rangeloop.go")
+
+		// Unlike the tests above, which runs vet in cmd/vet/, this one
+		// runs it in subdirectory, so the "full names" in the output
+		// are in fact short "./rangeloop.go".
+		// But we can't just pass "./rangeloop.go" as the "full name"
+		// argument to errorCheck as it does double duty as both a
+		// string that appears in the output, and as file name
+		// openable relative to the test directory, containing text
+		// expectations.
+		//
+		// So, we munge the file.
+		stderr = strings.ReplaceAll(stderr, filepath.FromSlash("./rangeloop.go"), filename)
+
+		if err := errorCheck(stderr, false, filename, filepath.Base(filename)); err != nil {
+			t.Errorf("error check failed: %s", err)
+			t.Log("vet stderr:\n", cmd.Stderr)
+		}
+	})
+
+	// The stdversion analyzer requires a lower-than-tip go
+	// version in its go.mod file for it to report anything.
+	// So again we use a testdata go.mod file to "downgrade".
+	t.Run("stdversion", func(t *testing.T) {
+		cmd := testenv.Command(t, testenv.GoToolPath(t), "vet", "-vettool="+vetPath(t), ".")
+		cmd.Env = append(os.Environ(), "GOWORK=off")
+		cmd.Dir = "testdata/stdversion"
+		cmd.Stderr = new(strings.Builder) // all vet output goes to stderr
+		cmd.Run()
+		stderr := cmd.Stderr.(fmt.Stringer).String()
+
+		filename := filepath.FromSlash("testdata/stdversion/stdversion.go")
+
+		// Unlike the tests above, which runs vet in cmd/vet/, this one
+		// runs it in subdirectory, so the "full names" in the output
+		// are in fact short "./rangeloop.go".
+		// But we can't just pass "./rangeloop.go" as the "full name"
+		// argument to errorCheck as it does double duty as both a
+		// string that appears in the output, and as file name
+		// openable relative to the test directory, containing text
+		// expectations.
+		//
+		// So, we munge the file.
+		stderr = strings.ReplaceAll(stderr, filepath.FromSlash("./stdversion.go"), filename)
+
+		if err := errorCheck(stderr, false, filename, filepath.Base(filename)); err != nil {
+			t.Errorf("error check failed: %s", err)
+			t.Log("vet stderr:\n", cmd.Stderr)
+		}
+	})
 }
 
 func cgoEnabled(t *testing.T) bool {
@@ -141,7 +175,7 @@ func cgoEnabled(t *testing.T) bool {
 	// That's fine for the builders, but causes commands like
 	// 'GOARCH=386 go test .' to fail.
 	// Instead, we ask the go command.
-	cmd := exec.Command(testenv.GoToolPath(t), "list", "-f", "{{context.CgoEnabled}}")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "list", "-f", "{{context.CgoEnabled}}")
 	out, _ := cmd.CombinedOutput()
 	return string(out) == "true\n"
 }
@@ -165,7 +199,6 @@ func errchk(c *exec.Cmd, files []string, t *testing.T) {
 // TestTags verifies that the -tags argument controls which files to check.
 func TestTags(t *testing.T) {
 	t.Parallel()
-	Build(t)
 	for tag, wantFile := range map[string]int{
 		"testtag":     1, // file1
 		"x testtag y": 1,
@@ -269,7 +302,7 @@ func errorCheck(outStr string, wantAuto bool, fullshort ...string) (err error) {
 	if len(errs) == 1 {
 		return errs[0]
 	}
-	var buf bytes.Buffer
+	var buf strings.Builder
 	fmt.Fprintf(&buf, "\n")
 	for _, err := range errs {
 		fmt.Fprintf(&buf, "%s\n", err.Error())
@@ -337,7 +370,7 @@ var (
 	errRx       = regexp.MustCompile(`// (?:GC_)?ERROR(NEXT)? (.*)`)
 	errAutoRx   = regexp.MustCompile(`// (?:GC_)?ERRORAUTO(NEXT)? (.*)`)
 	errQuotesRx = regexp.MustCompile(`"([^"]*)"`)
-	lineRx      = regexp.MustCompile(`LINE(([+-])([0-9]+))?`)
+	lineRx      = regexp.MustCompile(`LINE(([+-])(\d+))?`)
 )
 
 // wantedErrors parses expected errors from comments in a file.

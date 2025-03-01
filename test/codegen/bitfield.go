@@ -122,10 +122,10 @@ func sbfx1(x int64) int64 {
 }
 
 func sbfx2(x int64) int64 {
-	return (x << 60) >> 60 // arm64:"SBFX\tZR, R[0-9]+, [$]4",-"LSL",-"ASR"
+	return (x << 60) >> 60 // arm64:"SBFX\t[$]0, R[0-9]+, [$]4",-"LSL",-"ASR"
 }
 
-//  merge shift and sign-extension into sbfx.
+// merge shift and sign-extension into sbfx.
 func sbfx3(x int32) int64 {
 	return int64(x) >> 3 // arm64:"SBFX\t[$]3, R[0-9]+, [$]29",-"ASR"
 }
@@ -328,6 +328,7 @@ func ubfx16(x uint64) uint64 {
 }
 
 // Check that we don't emit comparisons for constant shifts.
+//
 //go:nosplit
 func shift_no_cmp(x int) int {
 	// arm64:`LSL\t[$]17`,-`CMP`
@@ -357,11 +358,15 @@ func rev16w(c uint32) (uint32, uint32, uint32) {
 
 func shift(x uint32, y uint16, z uint8) uint64 {
 	// arm64:-`MOVWU`,-`LSR\t[$]32`
+	// loong64:-`MOVWU`,-`SRLV\t[$]32`
 	a := uint64(x) >> 32
 	// arm64:-`MOVHU
+	// loong64:-`MOVHU`,-`SRLV\t[$]16`
 	b := uint64(y) >> 16
 	// arm64:-`MOVBU`
+	// loong64:-`MOVBU`,-`SRLV\t[$]8`
 	c := uint64(z) >> 8
 	// arm64:`MOVD\tZR`,-`ADD\tR[0-9]+>>16`,-`ADD\tR[0-9]+>>8`,
+	// loong64:`MOVV\t[$]0`,-`ADDVU`
 	return a + b + c
 }

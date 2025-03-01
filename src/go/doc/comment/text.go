@@ -21,7 +21,7 @@ type textPrinter struct {
 	width      int
 }
 
-// Text returns a textual formatting of the Doc.
+// Text returns a textual formatting of the [Doc].
 // See the [Printer] documentation for ways to customize the text output.
 func (p *Printer) Text(d *Doc) []byte {
 	tp := &textPrinter{
@@ -134,14 +134,13 @@ func (p *textPrinter) block(out *bytes.Buffer, x Block) {
 }
 
 // text prints the text sequence x to out.
-// TODO: Wrap lines.
 func (p *textPrinter) text(out *bytes.Buffer, indent string, x []Text) {
 	p.oneLongLine(&p.long, x)
 	words := strings.Fields(p.long.String())
 	p.long.Reset()
 
 	var seq []int
-	if p.width < 0 {
+	if p.width < 0 || len(words) == 0 {
 		seq = []int{0, len(words)} // one long line
 	} else {
 		seq = wrap(words, p.width-utf8.RuneCountInString(indent))

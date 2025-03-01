@@ -18,12 +18,10 @@ package parser
 import (
 	"fmt"
 	"go/ast"
-	"go/internal/typeparams"
+	"go/build/constraint"
 	"go/scanner"
 	"go/token"
-	"strconv"
 	"strings"
-	"unicode"
 )
 
 // The parser structure holds the parser's internal state.
@@ -41,6 +39,8 @@ type parser struct {
 	comments    []*ast.CommentGroup
 	leadComment *ast.CommentGroup // last lead comment
 	lineComment *ast.CommentGroup // last line comment
+	top         bool              // in top of file (before package clause)
+	goVersion   string            // minimum Go version found in //go:build comment
 
 	// Next token
 	pos token.Pos   // token position
@@ -59,24 +59,22 @@ type parser struct {
 	inRhs   bool // if set, the parser is parsing a rhs expression
 
 	imports []*ast.ImportSpec // list of imports
+
+	// nestLev is used to track and limit the recursion depth
+	// during parsing.
+	nestLev int
 }
 
-func (p *parser) init(fset *token.FileSet, filename string, src []byte, mode Mode) {
-	p.file = fset.AddFile(filename, -1, len(src))
-	var m scanner.Mode
-	if mode&ParseComments != 0 {
-		m = scanner.ScanComments
-	}
+func (p *parser) init(file *token.File, src []byte, mode Mode) {
+	p.file = file
 	eh := func(pos token.Position, msg string) { p.errors.Add(pos, msg) }
-	p.scanner.Init(p.file, src, eh, m)
+	p.scanner.Init(p.file, src, eh, scanner.ScanComments)
 
+	p.top = true
 	p.mode = mode
 	p.trace = mode&Trace != 0 // for convenience (p.trace is used frequently)
 	p.next()
 }
-
-func (p *parser) allowGenerics() bool { return p.mode&typeparams.DisallowParsing == 0 }
-func (p *parser) allowTypeSets() bool { return p.mode&typeparams.DisallowTypeSets == 0 }
 
 // ----------------------------------------------------------------------------
 // Parsing support
@@ -108,6 +106,24 @@ func un(p *parser) {
 	p.printTrace(")")
 }
 
+// maxNestLev is the deepest we're willing to recurse during parsing
+const maxNestLev int = 1e5
+
+func incNestLev(p *parser) *parser {
+	p.nestLev++
+	if p.nestLev > maxNestLev {
+		p.error(p.pos, "exceeded max nesting depth")
+		panic(bailout{})
+	}
+	return p
+}
+
+// decNestLev is used to track nesting depth during parsing to prevent stack exhaustion.
+// It is used along with incNestLev in a similar fashion to how un and trace are used.
+func decNestLev(p *parser) {
+	p.nestLev--
+}
+
 // Advance to the next token.
 func (p *parser) next0() {
 	// Because of one-token look-ahead, print the previous token
@@ -126,7 +142,23 @@ func (p *parser) next0() {
 		}
 	}
 
-	p.pos, p.tok, p.lit = p.scanner.Scan()
+	for {
+		p.pos, p.tok, p.lit = p.scanner.Scan()
+		if p.tok == token.COMMENT {
+			if p.top && strings.HasPrefix(p.lit, "//go:build") {
+				if x, err := constraint.Parse(p.lit); err == nil {
+					p.goVersion = constraint.GoVersion(x)
+				}
+			}
+			if p.mode&ParseComments == 0 {
+				continue
+			}
+		} else {
+			// Found a non-comment; top of file is over.
+			p.top = false
+		}
+		break
+	}
 }
 
 // Consume a comment and return it and the line on which it ends.
@@ -197,7 +229,7 @@ func (p *parser) next() {
 			// The comment is on same line as the previous token; it
 			// cannot be a lead comment but may be a line comment.
 			comment, endline = p.consumeCommentGroup(0)
-			if p.file.Line(p.pos) != endline || p.tok == token.EOF {
+			if p.file.Line(p.pos) != endline || p.tok == token.SEMICOLON || p.tok == token.EOF {
 				// The next token is on a different line, thus
 				// the last comment group is a line comment.
 				p.lineComment = comment
@@ -218,8 +250,12 @@ func (p *parser) next() {
 	}
 }
 
-// A bailout panic is raised to indicate early termination.
-type bailout struct{}
+// A bailout panic is raised to indicate early termination. pos and msg are
+// only populated when bailing out of object resolution.
+type bailout struct {
+	pos token.Pos
+	msg string
+}
 
 func (p *parser) error(pos token.Pos, msg string) {
 	if p.trace {
@@ -293,7 +329,8 @@ func (p *parser) expectClosing(tok token.Token, context string) token.Pos {
 	return p.expect(tok)
 }
 
-func (p *parser) expectSemi() {
+// expectSemi consumes a semicolon and returns the applicable line comment.
+func (p *parser) expectSemi() (comment *ast.CommentGroup) {
 	// semicolon is optional before a closing ')' or '}'
 	if p.tok != token.RPAREN && p.tok != token.RBRACE {
 		switch p.tok {
@@ -302,12 +339,22 @@ func (p *parser) expectSemi() {
 			p.errorExpected(p.pos, "';'")
 			fallthrough
 		case token.SEMICOLON:
-			p.next()
+			if p.lit == ";" {
+				// explicit semicolon
+				p.next()
+				comment = p.lineComment // use following comments
+			} else {
+				// artificial semicolon
+				comment = p.lineComment // use preceding comments
+				p.next()
+			}
+			return comment
 		default:
 			p.errorExpected(p.pos, "';'")
 			p.advance(stmtStart)
 		}
 	}
+	return nil
 }
 
 func (p *parser) atComma(context string, follow token.Token) bool {
@@ -379,9 +426,10 @@ var stmtStart = map[token.Token]bool{
 }
 
 var declStart = map[token.Token]bool{
-	token.CONST: true,
-	token.TYPE:  true,
-	token.VAR:   true,
+	token.IMPORT: true,
+	token.CONST:  true,
+	token.TYPE:   true,
+	token.VAR:    true,
 }
 
 var exprEnd = map[token.Token]bool{
@@ -450,10 +498,10 @@ func (p *parser) parseExprList() (list []ast.Expr) {
 		defer un(trace(p, "ExpressionList"))
 	}
 
-	list = append(list, p.checkExpr(p.parseExpr()))
+	list = append(list, p.parseExpr())
 	for p.tok == token.COMMA {
 		p.next()
-		list = append(list, p.checkExpr(p.parseExpr()))
+		list = append(list, p.parseExpr())
 	}
 
 	return
@@ -493,7 +541,7 @@ func (p *parser) parseQualifiedIdent(ident *ast.Ident) ast.Expr {
 	}
 
 	typ := p.parseTypeName(ident)
-	if p.tok == token.LBRACK && p.allowGenerics() {
+	if p.tok == token.LBRACK {
 		typ = p.parseTypeInstance(typ)
 	}
 
@@ -555,26 +603,20 @@ func (p *parser) parseArrayFieldOrTypeInstance(x *ast.Ident) (*ast.Ident, ast.Ex
 		defer un(trace(p, "ArrayFieldOrTypeInstance"))
 	}
 
-	// TODO(gri) Should we allow a trailing comma in a type argument
-	//           list such as T[P,]? (We do in parseTypeInstance).
 	lbrack := p.expect(token.LBRACK)
+	trailingComma := token.NoPos // if valid, the position of a trailing comma preceding the ']'
 	var args []ast.Expr
-	var firstComma token.Pos
-	// TODO(rfindley): consider changing parseRhsOrType so that this function variable
-	// is not needed.
-	argparser := p.parseRhsOrType
-	if !p.allowGenerics() {
-		argparser = p.parseRhs
-	}
 	if p.tok != token.RBRACK {
 		p.exprLev++
-		args = append(args, argparser())
+		args = append(args, p.parseRhs())
 		for p.tok == token.COMMA {
-			if !firstComma.IsValid() {
-				firstComma = p.pos
-			}
+			comma := p.pos
 			p.next()
-			args = append(args, argparser())
+			if p.tok == token.RBRACK {
+				trailingComma = comma
+				break
+			}
+			args = append(args, p.parseRhs())
 		}
 		p.exprLev--
 	}
@@ -591,21 +633,16 @@ func (p *parser) parseArrayFieldOrTypeInstance(x *ast.Ident) (*ast.Ident, ast.Ex
 		elt := p.tryIdentOrType()
 		if elt != nil {
 			// x [P]E
+			if trailingComma.IsValid() {
+				// Trailing commas are invalid in array type fields.
+				p.error(trailingComma, "unexpected comma; expecting ]")
+			}
 			return x, &ast.ArrayType{Lbrack: lbrack, Len: args[0], Elt: elt}
 		}
-		if !p.allowGenerics() {
-			p.error(rbrack, "missing element type in array type expression")
-			return nil, &ast.BadExpr{From: args[0].Pos(), To: args[0].End()}
-		}
-	}
-
-	if !p.allowGenerics() {
-		p.error(firstComma, "expected ']', found ','")
-		return x, &ast.BadExpr{From: args[0].Pos(), To: args[len(args)-1].End()}
 	}
 
 	// x[P], x[P1, P2], ...
-	return nil, typeparams.PackIndexExpr(x, lbrack, args, rbrack)
+	return nil, packIndexExpr(x, lbrack, args, rbrack)
 }
 
 func (p *parser) parseFieldDecl() *ast.Field {
@@ -617,7 +654,8 @@ func (p *parser) parseFieldDecl() *ast.Field {
 
 	var names []*ast.Ident
 	var typ ast.Expr
-	if p.tok == token.IDENT {
+	switch p.tok {
+	case token.IDENT:
 		name := p.parseIdent()
 		if p.tok == token.PERIOD || p.tok == token.STRING || p.tok == token.SEMICOLON || p.tok == token.RBRACE {
 			// embedded type
@@ -644,11 +682,46 @@ func (p *parser) parseFieldDecl() *ast.Field {
 				typ = p.parseType()
 			}
 		}
-	} else {
-		// embedded, possibly generic type
-		// (using the enclosing parentheses to distinguish it from a named field declaration)
-		// TODO(rFindley) confirm that this doesn't allow parenthesized embedded type
-		typ = p.parseType()
+	case token.MUL:
+		star := p.pos
+		p.next()
+		if p.tok == token.LPAREN {
+			// *(T)
+			p.error(p.pos, "cannot parenthesize embedded type")
+			p.next()
+			typ = p.parseQualifiedIdent(nil)
+			// expect closing ')' but no need to complain if missing
+			if p.tok == token.RPAREN {
+				p.next()
+			}
+		} else {
+			// *T
+			typ = p.parseQualifiedIdent(nil)
+		}
+		typ = &ast.StarExpr{Star: star, X: typ}
+
+	case token.LPAREN:
+		p.error(p.pos, "cannot parenthesize embedded type")
+		p.next()
+		if p.tok == token.MUL {
+			// (*T)
+			star := p.pos
+			p.next()
+			typ = &ast.StarExpr{Star: star, X: p.parseQualifiedIdent(nil)}
+		} else {
+			// (T)
+			typ = p.parseQualifiedIdent(nil)
+		}
+		// expect closing ')' but no need to complain if missing
+		if p.tok == token.RPAREN {
+			p.next()
+		}
+
+	default:
+		pos := p.pos
+		p.errorExpected(pos, "field name or embedded type")
+		p.advance(exprEnd)
+		typ = &ast.BadExpr{From: pos, To: p.pos}
 	}
 
 	var tag *ast.BasicLit
@@ -657,9 +730,9 @@ func (p *parser) parseFieldDecl() *ast.Field {
 		p.next()
 	}
 
-	p.expectSemi() // call before accessing p.linecomment
+	comment := p.expectSemi()
 
-	field := &ast.Field{Doc: doc, Names: names, Type: typ, Tag: tag, Comment: p.lineComment}
+	field := &ast.Field{Doc: doc, Names: names, Type: typ, Tag: tag, Comment: comment}
 	return field
 }
 
@@ -720,7 +793,7 @@ func (p *parser) parseParamDecl(name *ast.Ident, typeSetsOK bool) (f field) {
 	// TODO(rFindley) refactor to be more similar to paramDeclOrNil in the syntax
 	// package
 	if p.trace {
-		defer un(trace(p, "ParamDeclOrNil"))
+		defer un(trace(p, "ParamDecl"))
 	}
 
 	ptok := p.tok
@@ -799,33 +872,40 @@ func (p *parser) parseParamDecl(name *ast.Ident, typeSetsOK bool) (f field) {
 	return
 }
 
-func (p *parser) parseParameterList(name0 *ast.Ident, typ0 ast.Expr, closing token.Token) (params []*ast.Field) {
+func (p *parser) parseParameterList(name0 *ast.Ident, typ0 ast.Expr, closing token.Token, dddok bool) (params []*ast.Field) {
 	if p.trace {
 		defer un(trace(p, "ParameterList"))
 	}
 
 	// Type parameters are the only parameter list closed by ']'.
 	tparams := closing == token.RBRACK
-	// Type set notation is ok in type parameter lists.
-	typeSetsOK := tparams && p.allowTypeSets()
 
-	pos := p.pos
+	pos0 := p.pos
 	if name0 != nil {
-		pos = name0.Pos()
+		pos0 = name0.Pos()
+	} else if typ0 != nil {
+		pos0 = typ0.Pos()
 	}
+
+	// Note: The code below matches the corresponding code in the syntax
+	//       parser closely. Changes must be reflected in either parser.
+	//       For the code to match, we use the local []field list that
+	//       corresponds to []syntax.Field. At the end, the list must be
+	//       converted into an []*ast.Field.
 
 	var list []field
 	var named int // number of parameters that have an explicit name and type
+	var typed int // number of parameters that have an explicit type
 
 	for name0 != nil || p.tok != closing && p.tok != token.EOF {
 		var par field
 		if typ0 != nil {
-			if typeSetsOK {
+			if tparams {
 				typ0 = p.embeddedElem(typ0)
 			}
 			par = field{name0, typ0}
 		} else {
-			par = p.parseParamDecl(name0, typeSetsOK)
+			par = p.parseParamDecl(name0, tparams)
 		}
 		name0 = nil // 1st name was consumed if present
 		typ0 = nil  // 1st typ was consumed if present
@@ -833,6 +913,9 @@ func (p *parser) parseParameterList(name0 *ast.Ident, typ0 ast.Expr, closing tok
 			list = append(list, par)
 			if par.name != nil && par.typ != nil {
 				named++
+			}
+			if par.typ != nil {
+				typed++
 			}
 		}
 		if !p.atComma("parameter list", closing) {
@@ -845,13 +928,10 @@ func (p *parser) parseParameterList(name0 *ast.Ident, typ0 ast.Expr, closing tok
 		return // not uncommon
 	}
 
-	// TODO(gri) parameter distribution and conversion to []*ast.Field
-	//           can be combined and made more efficient
-
-	// distribute parameter types
+	// distribute parameter types (len(list) > 0)
 	if named == 0 {
 		// all unnamed => found names are type names
-		for i := 0; i < len(list); i++ {
+		for i := range list {
 			par := &list[i]
 			if typ := par.name; typ != nil {
 				par.typ = typ
@@ -859,42 +939,95 @@ func (p *parser) parseParameterList(name0 *ast.Ident, typ0 ast.Expr, closing tok
 			}
 		}
 		if tparams {
-			p.error(pos, "all type parameters must be named")
+			// This is the same error handling as below, adjusted for type parameters only.
+			// See comment below for details. (go.dev/issue/64534)
+			var errPos token.Pos
+			var msg string
+			if named == typed /* same as typed == 0 */ {
+				errPos = p.pos // position error at closing ]
+				msg = "missing type constraint"
+			} else {
+				errPos = pos0 // position at opening [ or first name
+				msg = "missing type parameter name"
+				if len(list) == 1 {
+					msg += " or invalid array length"
+				}
+			}
+			p.error(errPos, msg)
 		}
 	} else if named != len(list) {
-		// some named => all must be named
-		ok := true
-		var typ ast.Expr
-		missingName := pos
-		for i := len(list) - 1; i >= 0; i-- {
-			if par := &list[i]; par.typ != nil {
+		// some named or we're in a type parameter list => all must be named
+		var errPos token.Pos // left-most error position (or invalid)
+		var typ ast.Expr     // current type (from right to left)
+		for i := range list {
+			if par := &list[len(list)-i-1]; par.typ != nil {
 				typ = par.typ
 				if par.name == nil {
-					ok = false
-					missingName = par.typ.Pos()
+					errPos = typ.Pos()
 					n := ast.NewIdent("_")
-					n.NamePos = typ.Pos() // correct position
+					n.NamePos = errPos // correct position
 					par.name = n
 				}
 			} else if typ != nil {
 				par.typ = typ
 			} else {
 				// par.typ == nil && typ == nil => we only have a par.name
-				ok = false
-				missingName = par.name.Pos()
-				par.typ = &ast.BadExpr{From: par.name.Pos(), To: p.pos}
+				errPos = par.name.Pos()
+				par.typ = &ast.BadExpr{From: errPos, To: p.pos}
 			}
 		}
-		if !ok {
-			if tparams {
-				p.error(missingName, "all type parameters must be named")
+		if errPos.IsValid() {
+			// Not all parameters are named because named != len(list).
+			// If named == typed, there must be parameters that have no types.
+			// They must be at the end of the parameter list, otherwise types
+			// would have been filled in by the right-to-left sweep above and
+			// there would be no error.
+			// If tparams is set, the parameter list is a type parameter list.
+			var msg string
+			if named == typed {
+				errPos = p.pos // position error at closing token ) or ]
+				if tparams {
+					msg = "missing type constraint"
+				} else {
+					msg = "missing parameter type"
+				}
 			} else {
-				p.error(pos, "mixed named and unnamed parameters")
+				if tparams {
+					msg = "missing type parameter name"
+					// go.dev/issue/60812
+					if len(list) == 1 {
+						msg += " or invalid array length"
+					}
+				} else {
+					msg = "missing parameter name"
+				}
 			}
+			p.error(errPos, msg)
 		}
 	}
 
-	// convert list []*ast.Field
+	// check use of ...
+	first := true // only report first occurrence
+	for i, _ := range list {
+		f := &list[i]
+		if t, _ := f.typ.(*ast.Ellipsis); t != nil && (!dddok || i+1 < len(list)) {
+			if first {
+				first = false
+				if dddok {
+					p.error(t.Ellipsis, "can only use ... with final parameter")
+				} else {
+					p.error(t.Ellipsis, "invalid use of ...")
+				}
+			}
+			// use T instead of invalid ...T
+			// TODO(gri) would like to use `f.typ = t.Elt` but that causes problems
+			//           with the resolver in cases of reuse of the same identifier
+			f.typ = &ast.BadExpr{From: t.Pos(), To: t.End()}
+		}
+	}
+
+	// Convert list to []*ast.Field.
+	// If list contains types only, each type gets its own ast.Field.
 	if named == 0 {
 		// parameter list consists of types only
 		for _, par := range list {
@@ -904,7 +1037,8 @@ func (p *parser) parseParameterList(name0 *ast.Ident, typ0 ast.Expr, closing tok
 		return
 	}
 
-	// parameter list consists of named parameters with types
+	// If the parameter list consists of named parameters with types,
+	// collect all names with the same types into a single ast.Field.
 	var names []*ast.Ident
 	var typ ast.Expr
 	addParams := func() {
@@ -928,50 +1062,42 @@ func (p *parser) parseParameterList(name0 *ast.Ident, typ0 ast.Expr, closing tok
 	return
 }
 
-func (p *parser) parseParameters(acceptTParams bool) (tparams, params *ast.FieldList) {
+func (p *parser) parseTypeParameters() *ast.FieldList {
+	if p.trace {
+		defer un(trace(p, "TypeParameters"))
+	}
+
+	lbrack := p.expect(token.LBRACK)
+	var list []*ast.Field
+	if p.tok != token.RBRACK {
+		list = p.parseParameterList(nil, nil, token.RBRACK, false)
+	}
+	rbrack := p.expect(token.RBRACK)
+
+	if len(list) == 0 {
+		p.error(rbrack, "empty type parameter list")
+		return nil // avoid follow-on errors
+	}
+
+	return &ast.FieldList{Opening: lbrack, List: list, Closing: rbrack}
+}
+
+func (p *parser) parseParameters(result bool) *ast.FieldList {
 	if p.trace {
 		defer un(trace(p, "Parameters"))
 	}
 
-	if p.allowGenerics() && acceptTParams && p.tok == token.LBRACK {
-		opening := p.pos
-		p.next()
-		// [T any](params) syntax
-		list := p.parseParameterList(nil, nil, token.RBRACK)
-		rbrack := p.expect(token.RBRACK)
-		tparams = &ast.FieldList{Opening: opening, List: list, Closing: rbrack}
-		// Type parameter lists must not be empty.
-		if tparams.NumFields() == 0 {
-			p.error(tparams.Closing, "empty type parameter list")
-			tparams = nil // avoid follow-on errors
+	if !result || p.tok == token.LPAREN {
+		lparen := p.expect(token.LPAREN)
+		var list []*ast.Field
+		if p.tok != token.RPAREN {
+			list = p.parseParameterList(nil, nil, token.RPAREN, !result)
 		}
+		rparen := p.expect(token.RPAREN)
+		return &ast.FieldList{Opening: lparen, List: list, Closing: rparen}
 	}
 
-	opening := p.expect(token.LPAREN)
-
-	var fields []*ast.Field
-	if p.tok != token.RPAREN {
-		fields = p.parseParameterList(nil, nil, token.RPAREN)
-	}
-
-	rparen := p.expect(token.RPAREN)
-	params = &ast.FieldList{Opening: opening, List: fields, Closing: rparen}
-
-	return
-}
-
-func (p *parser) parseResult() *ast.FieldList {
-	if p.trace {
-		defer un(trace(p, "Result"))
-	}
-
-	if p.tok == token.LPAREN {
-		_, results := p.parseParameters(false)
-		return results
-	}
-
-	typ := p.tryIdentOrType()
-	if typ != nil {
+	if typ := p.tryIdentOrType(); typ != nil {
 		list := make([]*ast.Field, 1)
 		list[0] = &ast.Field{Type: typ}
 		return &ast.FieldList{List: list}
@@ -986,11 +1112,15 @@ func (p *parser) parseFuncType() *ast.FuncType {
 	}
 
 	pos := p.expect(token.FUNC)
-	tparams, params := p.parseParameters(true)
-	if tparams != nil {
-		p.error(tparams.Pos(), "function type must have no type parameters")
+	// accept type parameters for more tolerant parsing but complain
+	if p.tok == token.LBRACK {
+		tparams := p.parseTypeParameters()
+		if tparams != nil {
+			p.error(tparams.Opening, "function type must have no type parameters")
+		}
 	}
-	results := p.parseResult()
+	params := p.parseParameters(false)
+	results := p.parseParameters(true)
 
 	return &ast.FuncType{Func: pos, Params: params, Results: results}
 }
@@ -1006,7 +1136,7 @@ func (p *parser) parseMethodSpec() *ast.Field {
 	x := p.parseTypeName(nil)
 	if ident, _ := x.(*ast.Ident); ident != nil {
 		switch {
-		case p.tok == token.LBRACK && p.allowGenerics():
+		case p.tok == token.LBRACK:
 			// generic method or embedded instantiated type
 			lbrack := p.pos
 			p.next()
@@ -1018,13 +1148,13 @@ func (p *parser) parseMethodSpec() *ast.Field {
 				//
 				// Interface methods do not have type parameters. We parse them for a
 				// better error message and improved error recovery.
-				_ = p.parseParameterList(name0, nil, token.RBRACK)
+				_ = p.parseParameterList(name0, nil, token.RBRACK, false)
 				_ = p.expect(token.RBRACK)
 				p.error(lbrack, "interface method must have no type parameters")
 
 				// TODO(rfindley) refactor to share code with parseFuncType.
-				_, params := p.parseParameters(false)
-				results := p.parseResult()
+				params := p.parseParameters(false)
+				results := p.parseParameters(true)
 				idents = []*ast.Ident{ident}
 				typ = &ast.FuncType{
 					Func:    token.NoPos,
@@ -1048,13 +1178,13 @@ func (p *parser) parseMethodSpec() *ast.Field {
 					p.exprLev--
 				}
 				rbrack := p.expectClosing(token.RBRACK, "type argument list")
-				typ = typeparams.PackIndexExpr(ident, lbrack, list, rbrack)
+				typ = packIndexExpr(ident, lbrack, list, rbrack)
 			}
 		case p.tok == token.LPAREN:
 			// ordinary method
 			// TODO(rfindley) refactor to share code with parseFuncType.
-			_, params := p.parseParameters(false)
-			results := p.parseResult()
+			params := p.parseParameters(false)
+			results := p.parseParameters(true)
 			idents = []*ast.Ident{ident}
 			typ = &ast.FuncType{Func: token.NoPos, Params: params, Results: results}
 		default:
@@ -1064,7 +1194,7 @@ func (p *parser) parseMethodSpec() *ast.Field {
 	} else {
 		// embedded, possibly instantiated type
 		typ = x
-		if p.tok == token.LBRACK && p.allowGenerics() {
+		if p.tok == token.LBRACK {
 			// embedded instantiated interface
 			typ = p.parseTypeInstance(typ)
 		}
@@ -1135,33 +1265,28 @@ parseElements:
 		switch {
 		case p.tok == token.IDENT:
 			f := p.parseMethodSpec()
-			if f.Names == nil && p.allowGenerics() {
+			if f.Names == nil {
 				f.Type = p.embeddedElem(f.Type)
 			}
-			p.expectSemi()
-			f.Comment = p.lineComment
+			f.Comment = p.expectSemi()
 			list = append(list, f)
-		case p.tok == token.TILDE && p.allowGenerics():
+		case p.tok == token.TILDE:
 			typ := p.embeddedElem(nil)
-			p.expectSemi()
-			comment := p.lineComment
+			comment := p.expectSemi()
 			list = append(list, &ast.Field{Type: typ, Comment: comment})
-		case p.allowGenerics():
+		default:
 			if t := p.tryIdentOrType(); t != nil {
 				typ := p.embeddedElem(t)
-				p.expectSemi()
-				comment := p.lineComment
+				comment := p.expectSemi()
 				list = append(list, &ast.Field{Type: typ, Comment: comment})
 			} else {
 				break parseElements
 			}
-		default:
-			break parseElements
 		}
 	}
 
 	// TODO(rfindley): the error produced here could be improved, since we could
-	// accept a identifier, 'type', or a '}' at this point.
+	// accept an identifier, 'type', or a '}' at this point.
 	rbrace := p.expect(token.RBRACE)
 
 	return &ast.InterfaceType{
@@ -1214,7 +1339,6 @@ func (p *parser) parseChanType() *ast.ChanType {
 }
 
 func (p *parser) parseTypeInstance(typ ast.Expr) ast.Expr {
-	assert(p.allowGenerics(), "parseTypeInstance while not parsing type params")
 	if p.trace {
 		defer un(trace(p, "TypeInstance"))
 	}
@@ -1243,14 +1367,16 @@ func (p *parser) parseTypeInstance(typ ast.Expr) ast.Expr {
 		}
 	}
 
-	return typeparams.PackIndexExpr(typ, opening, list, closing)
+	return packIndexExpr(typ, opening, list, closing)
 }
 
 func (p *parser) tryIdentOrType() ast.Expr {
+	defer decNestLev(incNestLev(p))
+
 	switch p.tok {
 	case token.IDENT:
 		typ := p.parseTypeName(nil)
-		if p.tok == token.LBRACK && p.allowGenerics() {
+		if p.tok == token.LBRACK {
 			typ = p.parseTypeInstance(typ)
 		}
 		return typ
@@ -1262,8 +1388,7 @@ func (p *parser) tryIdentOrType() ast.Expr {
 	case token.MUL:
 		return p.parsePointerType()
 	case token.FUNC:
-		typ := p.parseFuncType()
-		return typ
+		return p.parseFuncType()
 	case token.INTERFACE:
 		return p.parseInterfaceType()
 	case token.MAP:
@@ -1343,7 +1468,7 @@ func (p *parser) parseFuncTypeOrLit() ast.Expr {
 }
 
 // parseOperand may return an expression or a raw type (incl. array
-// types of the form [...]T. Callers must verify the result.
+// types of the form [...]T). Callers must verify the result.
 func (p *parser) parseOperand() ast.Expr {
 	if p.trace {
 		defer un(trace(p, "Operand"))
@@ -1363,7 +1488,7 @@ func (p *parser) parseOperand() ast.Expr {
 		lparen := p.pos
 		p.next()
 		p.exprLev++
-		x := p.parseRhsOrType() // types may be parenthesized: (some type)
+		x := p.parseRhs() // types may be parenthesized: (some type)
 		p.exprLev--
 		rparen := p.expect(token.RPAREN)
 		return &ast.ParenExpr{Lparen: lparen, X: x, Rparen: rparen}
@@ -1439,11 +1564,10 @@ func (p *parser) parseIndexOrSliceOrInstance(x ast.Expr) ast.Expr {
 	var args []ast.Expr
 	var index [N]ast.Expr
 	var colons [N - 1]token.Pos
-	var firstComma token.Pos
 	if p.tok != token.COLON {
 		// We can't know if we have an index expression or a type instantiation;
 		// so even if we see a (named) type we are not going to be in type context.
-		index[0] = p.parseRhsOrType()
+		index[0] = p.parseRhs()
 	}
 	ncolons := 0
 	switch p.tok {
@@ -1458,7 +1582,6 @@ func (p *parser) parseIndexOrSliceOrInstance(x ast.Expr) ast.Expr {
 			}
 		}
 	case token.COMMA:
-		firstComma = p.pos
 		// instance expression
 		args = append(args, index[0])
 		for p.tok == token.COMMA {
@@ -1477,14 +1600,14 @@ func (p *parser) parseIndexOrSliceOrInstance(x ast.Expr) ast.Expr {
 		slice3 := false
 		if ncolons == 2 {
 			slice3 = true
-			// Check presence of 2nd and 3rd index here rather than during type-checking
-			// to prevent erroneous programs from passing through gofmt (was issue 7305).
+			// Check presence of middle and final index here rather than during type-checking
+			// to prevent erroneous programs from passing through gofmt (was go.dev/issue/7305).
 			if index[1] == nil {
-				p.error(colons[0], "2nd index required in 3-index slice")
+				p.error(colons[0], "middle index required in 3-index slice")
 				index[1] = &ast.BadExpr{From: colons[0] + 1, To: colons[1]}
 			}
 			if index[2] == nil {
-				p.error(colons[1], "3rd index required in 3-index slice")
+				p.error(colons[1], "final index required in 3-index slice")
 				index[2] = &ast.BadExpr{From: colons[1] + 1, To: rbrack}
 			}
 		}
@@ -1496,13 +1619,8 @@ func (p *parser) parseIndexOrSliceOrInstance(x ast.Expr) ast.Expr {
 		return &ast.IndexExpr{X: x, Lbrack: lbrack, Index: index[0], Rbrack: rbrack}
 	}
 
-	if !p.allowGenerics() {
-		p.error(firstComma, "expected ']' or ':', found ','")
-		return &ast.BadExpr{From: args[0].Pos(), To: args[len(args)-1].End()}
-	}
-
 	// instance expression
-	return typeparams.PackIndexExpr(x, lbrack, args, rbrack)
+	return packIndexExpr(x, lbrack, args, rbrack)
 }
 
 func (p *parser) parseCallOrConversion(fun ast.Expr) *ast.CallExpr {
@@ -1515,7 +1633,7 @@ func (p *parser) parseCallOrConversion(fun ast.Expr) *ast.CallExpr {
 	var list []ast.Expr
 	var ellipsis token.Pos
 	for p.tok != token.RPAREN && p.tok != token.EOF && !ellipsis.IsValid() {
-		list = append(list, p.parseRhsOrType()) // builtins may expect a type: make(some type, ...)
+		list = append(list, p.parseRhs()) // builtins may expect a type: make(some type, ...)
 		if p.tok == token.ELLIPSIS {
 			ellipsis = p.pos
 			p.next()
@@ -1540,7 +1658,7 @@ func (p *parser) parseValue() ast.Expr {
 		return p.parseLiteralValue(nil)
 	}
 
-	x := p.checkExpr(p.parseExpr())
+	x := p.parseExpr()
 
 	return x
 }
@@ -1577,6 +1695,8 @@ func (p *parser) parseElementList() (list []ast.Expr) {
 }
 
 func (p *parser) parseLiteralValue(typ ast.Expr) ast.Expr {
+	defer decNestLev(incNestLev(p))
+
 	if p.trace {
 		defer un(trace(p, "LiteralValue"))
 	}
@@ -1592,63 +1712,6 @@ func (p *parser) parseLiteralValue(typ ast.Expr) ast.Expr {
 	return &ast.CompositeLit{Type: typ, Lbrace: lbrace, Elts: elts, Rbrace: rbrace}
 }
 
-// checkExpr checks that x is an expression (and not a type).
-func (p *parser) checkExpr(x ast.Expr) ast.Expr {
-	switch unparen(x).(type) {
-	case *ast.BadExpr:
-	case *ast.Ident:
-	case *ast.BasicLit:
-	case *ast.FuncLit:
-	case *ast.CompositeLit:
-	case *ast.ParenExpr:
-		panic("unreachable")
-	case *ast.SelectorExpr:
-	case *ast.IndexExpr:
-	case *ast.IndexListExpr:
-	case *ast.SliceExpr:
-	case *ast.TypeAssertExpr:
-		// If t.Type == nil we have a type assertion of the form
-		// y.(type), which is only allowed in type switch expressions.
-		// It's hard to exclude those but for the case where we are in
-		// a type switch. Instead be lenient and test this in the type
-		// checker.
-	case *ast.CallExpr:
-	case *ast.StarExpr:
-	case *ast.UnaryExpr:
-	case *ast.BinaryExpr:
-	default:
-		// all other nodes are not proper expressions
-		p.errorExpected(x.Pos(), "expression")
-		x = &ast.BadExpr{From: x.Pos(), To: p.safePos(x.End())}
-	}
-	return x
-}
-
-// If x is of the form (T), unparen returns unparen(T), otherwise it returns x.
-func unparen(x ast.Expr) ast.Expr {
-	if p, isParen := x.(*ast.ParenExpr); isParen {
-		x = unparen(p.X)
-	}
-	return x
-}
-
-// checkExprOrType checks that x is an expression or a type
-// (and not a raw type such as [...]T).
-func (p *parser) checkExprOrType(x ast.Expr) ast.Expr {
-	switch t := unparen(x).(type) {
-	case *ast.ParenExpr:
-		panic("unreachable")
-	case *ast.ArrayType:
-		if len, isEllipsis := t.Len.(*ast.Ellipsis); isEllipsis {
-			p.error(len.Pos(), "expected array length, found '...'")
-			x = &ast.BadExpr{From: x.Pos(), To: p.safePos(x.End())}
-		}
-	}
-
-	// all other nodes are expressions or types
-	return x
-}
-
 func (p *parser) parsePrimaryExpr(x ast.Expr) ast.Expr {
 	if p.trace {
 		defer un(trace(p, "PrimaryExpr"))
@@ -1657,15 +1720,21 @@ func (p *parser) parsePrimaryExpr(x ast.Expr) ast.Expr {
 	if x == nil {
 		x = p.parseOperand()
 	}
-	for {
+	// We track the nesting here rather than at the entry for the function,
+	// since it can iteratively produce a nested output, and we want to
+	// limit how deep a structure we generate.
+	var n int
+	defer func() { p.nestLev -= n }()
+	for n = 1; ; n++ {
+		incNestLev(p)
 		switch p.tok {
 		case token.PERIOD:
 			p.next()
 			switch p.tok {
 			case token.IDENT:
-				x = p.parseSelector(p.checkExprOrType(x))
+				x = p.parseSelector(x)
 			case token.LPAREN:
-				x = p.parseTypeAssertion(p.checkExpr(x))
+				x = p.parseTypeAssertion(x)
 			default:
 				pos := p.pos
 				p.errorExpected(pos, "selector or type assertion")
@@ -1681,13 +1750,13 @@ func (p *parser) parsePrimaryExpr(x ast.Expr) ast.Expr {
 				x = &ast.SelectorExpr{X: x, Sel: sel}
 			}
 		case token.LBRACK:
-			x = p.parseIndexOrSliceOrInstance(p.checkExpr(x))
+			x = p.parseIndexOrSliceOrInstance(x)
 		case token.LPAREN:
-			x = p.parseCallOrConversion(p.checkExprOrType(x))
+			x = p.parseCallOrConversion(x)
 		case token.LBRACE:
 			// operand may have returned a parenthesized complit
 			// type; accept it but complain if we have a complit
-			t := unparen(x)
+			t := ast.Unparen(x)
 			// determine if '{' belongs to a composite literal or a block statement
 			switch t.(type) {
 			case *ast.BadExpr, *ast.Ident, *ast.SelectorExpr:
@@ -1717,6 +1786,8 @@ func (p *parser) parsePrimaryExpr(x ast.Expr) ast.Expr {
 }
 
 func (p *parser) parseUnaryExpr() ast.Expr {
+	defer decNestLev(incNestLev(p))
+
 	if p.trace {
 		defer un(trace(p, "UnaryExpr"))
 	}
@@ -1726,7 +1797,7 @@ func (p *parser) parseUnaryExpr() ast.Expr {
 		pos, op := p.pos, p.tok
 		p.next()
 		x := p.parseUnaryExpr()
-		return &ast.UnaryExpr{OpPos: pos, Op: op, X: p.checkExpr(x)}
+		return &ast.UnaryExpr{OpPos: pos, Op: op, X: x}
 
 	case token.ARROW:
 		// channel type or receive expression
@@ -1772,14 +1843,14 @@ func (p *parser) parseUnaryExpr() ast.Expr {
 		}
 
 		// <-(expr)
-		return &ast.UnaryExpr{OpPos: arrow, Op: token.ARROW, X: p.checkExpr(x)}
+		return &ast.UnaryExpr{OpPos: arrow, Op: token.ARROW, X: x}
 
 	case token.MUL:
 		// pointer type or unary "*" expression
 		pos := p.pos
 		p.next()
 		x := p.parseUnaryExpr()
-		return &ast.StarExpr{Star: pos, X: p.checkExprOrType(x)}
+		return &ast.StarExpr{Star: pos, X: x}
 	}
 
 	return p.parsePrimaryExpr(nil)
@@ -1795,10 +1866,9 @@ func (p *parser) tokPrec() (token.Token, int) {
 
 // parseBinaryExpr parses a (possibly) binary expression.
 // If x is non-nil, it is used as the left operand.
-// If check is true, operands are checked to be valid expressions.
 //
 // TODO(rfindley): parseBinaryExpr has become overloaded. Consider refactoring.
-func (p *parser) parseBinaryExpr(x ast.Expr, prec1 int, check bool) ast.Expr {
+func (p *parser) parseBinaryExpr(x ast.Expr, prec1 int) ast.Expr {
 	if p.trace {
 		defer un(trace(p, "BinaryExpr"))
 	}
@@ -1806,61 +1876,36 @@ func (p *parser) parseBinaryExpr(x ast.Expr, prec1 int, check bool) ast.Expr {
 	if x == nil {
 		x = p.parseUnaryExpr()
 	}
-	for {
+	// We track the nesting here rather than at the entry for the function,
+	// since it can iteratively produce a nested output, and we want to
+	// limit how deep a structure we generate.
+	var n int
+	defer func() { p.nestLev -= n }()
+	for n = 1; ; n++ {
+		incNestLev(p)
 		op, oprec := p.tokPrec()
 		if oprec < prec1 {
 			return x
 		}
 		pos := p.expect(op)
-		y := p.parseBinaryExpr(nil, oprec+1, check)
-		if check {
-			x = p.checkExpr(x)
-			y = p.checkExpr(y)
-		}
+		y := p.parseBinaryExpr(nil, oprec+1)
 		x = &ast.BinaryExpr{X: x, OpPos: pos, Op: op, Y: y}
 	}
 }
 
-// checkBinaryExpr checks binary expressions that were not already checked by
-// parseBinaryExpr, because the latter was called with check=false.
-func (p *parser) checkBinaryExpr(x ast.Expr) {
-	bx, ok := x.(*ast.BinaryExpr)
-	if !ok {
-		return
-	}
-
-	bx.X = p.checkExpr(bx.X)
-	bx.Y = p.checkExpr(bx.Y)
-
-	// parseBinaryExpr checks x and y for each binary expr in a tree, so we
-	// traverse the tree of binary exprs starting from x.
-	p.checkBinaryExpr(bx.X)
-	p.checkBinaryExpr(bx.Y)
-}
-
-// The result may be a type or even a raw type ([...]int). Callers must
-// check the result (using checkExpr or checkExprOrType), depending on
-// context.
+// The result may be a type or even a raw type ([...]int).
 func (p *parser) parseExpr() ast.Expr {
 	if p.trace {
 		defer un(trace(p, "Expression"))
 	}
 
-	return p.parseBinaryExpr(nil, token.LowestPrec+1, true)
+	return p.parseBinaryExpr(nil, token.LowestPrec+1)
 }
 
 func (p *parser) parseRhs() ast.Expr {
 	old := p.inRhs
 	p.inRhs = true
-	x := p.checkExpr(p.parseExpr())
-	p.inRhs = old
-	return x
-}
-
-func (p *parser) parseRhsOrType() ast.Expr {
-	old := p.inRhs
-	p.inRhs = true
-	x := p.checkExprOrType(p.parseExpr())
+	x := p.parseExpr()
 	p.inRhs = old
 	return x
 }
@@ -1905,11 +1950,7 @@ func (p *parser) parseSimpleStmt(mode int) (ast.Stmt, bool) {
 		} else {
 			y = p.parseList(true)
 		}
-		as := &ast.AssignStmt{Lhs: x, TokPos: pos, Tok: tok, Rhs: y}
-		if tok == token.DEFINE {
-			p.checkAssignStmt(as)
-		}
-		return as, isRange
+		return &ast.AssignStmt{Lhs: x, TokPos: pos, Tok: tok, Rhs: y}, isRange
 	}
 
 	if len(x) > 1 {
@@ -1956,22 +1997,18 @@ func (p *parser) parseSimpleStmt(mode int) (ast.Stmt, bool) {
 	return &ast.ExprStmt{X: x[0]}, false
 }
 
-func (p *parser) checkAssignStmt(as *ast.AssignStmt) {
-	for _, x := range as.Lhs {
-		if _, isIdent := x.(*ast.Ident); !isIdent {
-			p.errorExpected(x.Pos(), "identifier on left side of :=")
-		}
-	}
-}
-
 func (p *parser) parseCallExpr(callType string) *ast.CallExpr {
-	x := p.parseRhsOrType() // could be a conversion: (some type)(x)
+	x := p.parseRhs() // could be a conversion: (some type)(x)
+	if t := ast.Unparen(x); t != x {
+		p.error(x.Pos(), fmt.Sprintf("expression in %s must not be parenthesized", callType))
+		x = t
+	}
 	if call, isCall := x.(*ast.CallExpr); isCall {
 		return call
 	}
 	if _, isBad := x.(*ast.BadExpr); !isBad {
 		// only report error if it's a new one
-		p.error(p.safePos(x.End()), fmt.Sprintf("function must be invoked in %s statement", callType))
+		p.error(p.safePos(x.End()), fmt.Sprintf("expression in %s must be function call", callType))
 	}
 	return nil
 }
@@ -2029,7 +2066,7 @@ func (p *parser) parseBranchStmt(tok token.Token) *ast.BranchStmt {
 
 	pos := p.expect(tok)
 	var label *ast.Ident
-	if tok != token.FALLTHROUGH && p.tok == token.IDENT {
+	if tok == token.GOTO || ((tok == token.CONTINUE || tok == token.BREAK) && p.tok == token.IDENT) {
 		label = p.parseIdent()
 	}
 	p.expectSemi()
@@ -2042,7 +2079,7 @@ func (p *parser) makeExpr(s ast.Stmt, want string) ast.Expr {
 		return nil
 	}
 	if es, isExpr := s.(*ast.ExprStmt); isExpr {
-		return p.checkExpr(es.X)
+		return es.X
 	}
 	found := "simple statement"
 	if _, isAss := s.(*ast.AssignStmt); isAss {
@@ -2070,7 +2107,7 @@ func (p *parser) parseIfHeader() (init ast.Stmt, cond ast.Expr) {
 		// accept potential variable declaration but complain
 		if p.tok == token.VAR {
 			p.next()
-			p.error(p.pos, "var declaration not allowed in 'IF' initializer")
+			p.error(p.pos, "var declaration not allowed in if initializer")
 		}
 		init, _ = p.parseSimpleStmt(basic)
 	}
@@ -2116,6 +2153,8 @@ func (p *parser) parseIfHeader() (init ast.Stmt, cond ast.Expr) {
 }
 
 func (p *parser) parseIfStmt() *ast.IfStmt {
+	defer decNestLev(incNestLev(p))
+
 	if p.trace {
 		defer un(trace(p, "IfStmt"))
 	}
@@ -2145,21 +2184,7 @@ func (p *parser) parseIfStmt() *ast.IfStmt {
 	return &ast.IfStmt{If: pos, Init: init, Cond: cond, Body: body, Else: else_}
 }
 
-func (p *parser) parseTypeList() (list []ast.Expr) {
-	if p.trace {
-		defer un(trace(p, "TypeList"))
-	}
-
-	list = append(list, p.parseType())
-	for p.tok == token.COMMA {
-		p.next()
-		list = append(list, p.parseType())
-	}
-
-	return
-}
-
-func (p *parser) parseCaseClause(typeSwitch bool) *ast.CaseClause {
+func (p *parser) parseCaseClause() *ast.CaseClause {
 	if p.trace {
 		defer un(trace(p, "CaseClause"))
 	}
@@ -2168,11 +2193,7 @@ func (p *parser) parseCaseClause(typeSwitch bool) *ast.CaseClause {
 	var list []ast.Expr
 	if p.tok == token.CASE {
 		p.next()
-		if typeSwitch {
-			list = p.parseTypeList()
-		} else {
-			list = p.parseList(true)
-		}
+		list = p.parseList(true)
 	} else {
 		p.expect(token.DEFAULT)
 	}
@@ -2250,7 +2271,7 @@ func (p *parser) parseSwitchStmt() ast.Stmt {
 	lbrace := p.expect(token.LBRACE)
 	var list []ast.Stmt
 	for p.tok == token.CASE || p.tok == token.DEFAULT {
-		list = append(list, p.parseCaseClause(typeSwitch))
+		list = append(list, p.parseCaseClause())
 	}
 	rbrace := p.expect(token.RBRACE)
 	p.expectSemi()
@@ -2295,11 +2316,7 @@ func (p *parser) parseCommClause() *ast.CommClause {
 				pos := p.pos
 				p.next()
 				rhs := p.parseRhs()
-				as := &ast.AssignStmt{Lhs: lhs, TokPos: pos, Tok: tok, Rhs: []ast.Expr{rhs}}
-				if tok == token.DEFINE {
-					p.checkAssignStmt(as)
-				}
-				comm = as
+				comm = &ast.AssignStmt{Lhs: lhs, TokPos: pos, Tok: tok, Rhs: []ast.Expr{rhs}}
 			} else {
 				// lhs must be single receive operation
 				if len(lhs) > 1 {
@@ -2403,6 +2420,7 @@ func (p *parser) parseForStmt() ast.Stmt {
 			Value:  value,
 			TokPos: as.TokPos,
 			Tok:    as.Tok,
+			Range:  as.Rhs[0].Pos(),
 			X:      x,
 			Body:   body,
 		}
@@ -2419,6 +2437,8 @@ func (p *parser) parseForStmt() ast.Stmt {
 }
 
 func (p *parser) parseStmt() (s ast.Stmt) {
+	defer decNestLev(incNestLev(p))
+
 	if p.trace {
 		defer un(trace(p, "Statement"))
 	}
@@ -2480,91 +2500,85 @@ func (p *parser) parseStmt() (s ast.Stmt) {
 // ----------------------------------------------------------------------------
 // Declarations
 
-type parseSpecFunction func(doc *ast.CommentGroup, pos token.Pos, keyword token.Token, iota int) ast.Spec
+type parseSpecFunction func(doc *ast.CommentGroup, keyword token.Token, iota int) ast.Spec
 
-func isValidImport(lit string) bool {
-	const illegalChars = `!"#$%&'()*,:;<=>?[\]^{|}` + "`\uFFFD"
-	s, _ := strconv.Unquote(lit) // go/scanner returns a legal string literal
-	for _, r := range s {
-		if !unicode.IsGraphic(r) || unicode.IsSpace(r) || strings.ContainsRune(illegalChars, r) {
-			return false
-		}
-	}
-	return s != ""
-}
-
-func (p *parser) parseImportSpec(doc *ast.CommentGroup, _ token.Pos, _ token.Token, _ int) ast.Spec {
+func (p *parser) parseImportSpec(doc *ast.CommentGroup, _ token.Token, _ int) ast.Spec {
 	if p.trace {
 		defer un(trace(p, "ImportSpec"))
 	}
 
 	var ident *ast.Ident
 	switch p.tok {
+	case token.IDENT:
+		ident = p.parseIdent()
 	case token.PERIOD:
 		ident = &ast.Ident{NamePos: p.pos, Name: "."}
 		p.next()
-	case token.IDENT:
-		ident = p.parseIdent()
 	}
 
 	pos := p.pos
 	var path string
 	if p.tok == token.STRING {
 		path = p.lit
-		if !isValidImport(path) {
-			p.error(pos, "invalid import path: "+path)
-		}
+		p.next()
+	} else if p.tok.IsLiteral() {
+		p.error(pos, "import path must be a string")
 		p.next()
 	} else {
-		p.expect(token.STRING) // use expect() error handling
+		p.error(pos, "missing import path")
+		p.advance(exprEnd)
 	}
-	p.expectSemi() // call before accessing p.linecomment
+	comment := p.expectSemi()
 
 	// collect imports
 	spec := &ast.ImportSpec{
 		Doc:     doc,
 		Name:    ident,
 		Path:    &ast.BasicLit{ValuePos: pos, Kind: token.STRING, Value: path},
-		Comment: p.lineComment,
+		Comment: comment,
 	}
 	p.imports = append(p.imports, spec)
 
 	return spec
 }
 
-func (p *parser) parseValueSpec(doc *ast.CommentGroup, _ token.Pos, keyword token.Token, iota int) ast.Spec {
+func (p *parser) parseValueSpec(doc *ast.CommentGroup, keyword token.Token, iota int) ast.Spec {
 	if p.trace {
 		defer un(trace(p, keyword.String()+"Spec"))
 	}
 
-	pos := p.pos
 	idents := p.parseIdentList()
-	typ := p.tryIdentOrType()
+	var typ ast.Expr
 	var values []ast.Expr
-	// always permit optional initialization for more tolerant parsing
-	if p.tok == token.ASSIGN {
-		p.next()
-		values = p.parseList(true)
-	}
-	p.expectSemi() // call before accessing p.linecomment
-
 	switch keyword {
-	case token.VAR:
-		if typ == nil && values == nil {
-			p.error(pos, "missing variable type or initialization")
-		}
 	case token.CONST:
-		if values == nil && (iota == 0 || typ != nil) {
-			p.error(pos, "missing constant value")
+		// always permit optional type and initialization for more tolerant parsing
+		if p.tok != token.EOF && p.tok != token.SEMICOLON && p.tok != token.RPAREN {
+			typ = p.tryIdentOrType()
+			if p.tok == token.ASSIGN {
+				p.next()
+				values = p.parseList(true)
+			}
 		}
+	case token.VAR:
+		if p.tok != token.ASSIGN {
+			typ = p.parseType()
+		}
+		if p.tok == token.ASSIGN {
+			p.next()
+			values = p.parseList(true)
+		}
+	default:
+		panic("unreachable")
 	}
+	comment := p.expectSemi()
 
 	spec := &ast.ValueSpec{
 		Doc:     doc,
 		Names:   idents,
 		Type:    typ,
 		Values:  values,
-		Comment: p.lineComment,
+		Comment: comment,
 	}
 	return spec
 }
@@ -2574,11 +2588,9 @@ func (p *parser) parseGenericType(spec *ast.TypeSpec, openPos token.Pos, name0 *
 		defer un(trace(p, "parseGenericType"))
 	}
 
-	list := p.parseParameterList(name0, typ0, token.RBRACK)
+	list := p.parseParameterList(name0, typ0, token.RBRACK, false)
 	closePos := p.expect(token.RBRACK)
 	spec.TypeParams = &ast.FieldList{Opening: openPos, List: list, Closing: closePos}
-	// Let the type checker decide whether to accept type parameters on aliases:
-	// see issue #46477.
 	if p.tok == token.ASSIGN {
 		// type alias
 		spec.Assign = p.pos
@@ -2587,7 +2599,7 @@ func (p *parser) parseGenericType(spec *ast.TypeSpec, openPos token.Pos, name0 *
 	spec.Type = p.parseType()
 }
 
-func (p *parser) parseTypeSpec(doc *ast.CommentGroup, _ token.Pos, _ token.Token, _ int) ast.Spec {
+func (p *parser) parseTypeSpec(doc *ast.CommentGroup, _ token.Token, _ int) ast.Spec {
 	if p.trace {
 		defer un(trace(p, "TypeSpec"))
 	}
@@ -2595,7 +2607,7 @@ func (p *parser) parseTypeSpec(doc *ast.CommentGroup, _ token.Pos, _ token.Token
 	name := p.parseIdent()
 	spec := &ast.TypeSpec{Doc: doc, Name: name}
 
-	if p.tok == token.LBRACK && p.allowGenerics() {
+	if p.tok == token.LBRACK {
 		// spec.Name "[" ...
 		// array/slice type or type parameter list
 		lbrack := p.pos
@@ -2623,7 +2635,7 @@ func (p *parser) parseTypeSpec(doc *ast.CommentGroup, _ token.Pos, _ token.Token
 				// to parser.expr, and pass in name to parsePrimaryExpr.
 				p.exprLev++
 				lhs := p.parsePrimaryExpr(x)
-				x = p.parseBinaryExpr(lhs, token.LowestPrec+1, false)
+				x = p.parseBinaryExpr(lhs, token.LowestPrec+1)
 				p.exprLev--
 			}
 			// Analyze expression x. If we can split x into a type parameter
@@ -2657,8 +2669,7 @@ func (p *parser) parseTypeSpec(doc *ast.CommentGroup, _ token.Pos, _ token.Token
 		spec.Type = p.parseType()
 	}
 
-	p.expectSemi() // call before accessing p.linecomment
-	spec.Comment = p.lineComment
+	spec.Comment = p.expectSemi()
 
 	return spec
 }
@@ -2675,8 +2686,8 @@ func (p *parser) parseTypeSpec(doc *ast.CommentGroup, _ token.Pos, _ token.Token
 //	P*[]int     T/F      P       *[]int
 //	P*E         T        P       *E
 //	P*E         F        nil     P*E
-//	P([]int)    T/F      P       []int
-//	P(E)        T        P       E
+//	P([]int)    T/F      P       ([]int)
+//	P(E)        T        P       (E)
 //	P(E)        F        nil     P(E)
 //	P*E|F|~G    T/F      P       *E|F|~G
 //	P*E|F|G     T        P       *E|F|G
@@ -2703,8 +2714,14 @@ func extractName(x ast.Expr, force bool) (*ast.Ident, ast.Expr) {
 	case *ast.CallExpr:
 		if name, _ := x.Fun.(*ast.Ident); name != nil {
 			if len(x.Args) == 1 && x.Ellipsis == token.NoPos && (force || isTypeElem(x.Args[0])) {
-				// x = name "(" x.ArgList[0] ")"
-				return name, x.Args[0]
+				// x = name (x.Args[0])
+				// (Note that the cmd/compile/internal/syntax parser does not care
+				// about syntax tree fidelity and does not preserve parentheses here.)
+				return name, &ast.ParenExpr{
+					Lparen: x.Lparen,
+					X:      x.Args[0],
+					Rparen: x.Rparen,
+				}
 			}
 		}
 	}
@@ -2740,12 +2757,12 @@ func (p *parser) parseGenDecl(keyword token.Token, f parseSpecFunction) *ast.Gen
 		lparen = p.pos
 		p.next()
 		for iota := 0; p.tok != token.RPAREN && p.tok != token.EOF; iota++ {
-			list = append(list, f(p.leadComment, pos, keyword, iota))
+			list = append(list, f(p.leadComment, keyword, iota))
 		}
 		rparen = p.expect(token.RPAREN)
 		p.expectSemi()
 	} else {
-		list = append(list, f(nil, pos, keyword, 0))
+		list = append(list, f(nil, keyword, 0))
 	}
 
 	return &ast.GenDecl{
@@ -2768,19 +2785,23 @@ func (p *parser) parseFuncDecl() *ast.FuncDecl {
 
 	var recv *ast.FieldList
 	if p.tok == token.LPAREN {
-		_, recv = p.parseParameters(false)
+		recv = p.parseParameters(false)
 	}
 
 	ident := p.parseIdent()
 
-	tparams, params := p.parseParameters(true)
-	if recv != nil && tparams != nil {
-		// Method declarations do not have type parameters. We parse them for a
-		// better error message and improved error recovery.
-		p.error(tparams.Opening, "method must have no type parameters")
-		tparams = nil
+	var tparams *ast.FieldList
+	if p.tok == token.LBRACK {
+		tparams = p.parseTypeParameters()
+		if recv != nil && tparams != nil {
+			// Method declarations do not have type parameters. We parse them for a
+			// better error message and improved error recovery.
+			p.error(tparams.Opening, "method must have no type parameters")
+			tparams = nil
+		}
 	}
-	results := p.parseResult()
+	params := p.parseParameters(false)
+	results := p.parseParameters(true)
 
 	var body *ast.BlockStmt
 	switch p.tok {
@@ -2821,6 +2842,9 @@ func (p *parser) parseDecl(sync map[token.Token]bool) ast.Decl {
 
 	var f parseSpecFunction
 	switch p.tok {
+	case token.IMPORT:
+		f = p.parseImportSpec
+
 	case token.CONST, token.VAR:
 		f = p.parseValueSpec
 
@@ -2880,19 +2904,28 @@ func (p *parser) parseFile() *ast.File {
 
 		if p.mode&ImportsOnly == 0 {
 			// rest of package body
+			prev := token.IMPORT
 			for p.tok != token.EOF {
+				// Continue to accept import declarations for error tolerance, but complain.
+				if p.tok == token.IMPORT && prev != token.IMPORT {
+					p.error(p.pos, "imports must appear before other declarations")
+				}
+				prev = p.tok
+
 				decls = append(decls, p.parseDecl(declStart))
 			}
 		}
 	}
 
 	f := &ast.File{
-		Doc:      doc,
-		Package:  pos,
-		Name:     ident,
-		Decls:    decls,
-		Imports:  p.imports,
-		Comments: p.comments,
+		Doc:     doc,
+		Package: pos,
+		Name:    ident,
+		Decls:   decls,
+		// File{Start,End} are set by the defer in the caller.
+		Imports:   p.imports,
+		Comments:  p.comments,
+		GoVersion: p.goVersion,
 	}
 	var declErr func(token.Pos, string)
 	if p.mode&DeclarationErrors != 0 {
@@ -2903,4 +2936,26 @@ func (p *parser) parseFile() *ast.File {
 	}
 
 	return f
+}
+
+// packIndexExpr returns an IndexExpr x[expr0] or IndexListExpr x[expr0, ...].
+func packIndexExpr(x ast.Expr, lbrack token.Pos, exprs []ast.Expr, rbrack token.Pos) ast.Expr {
+	switch len(exprs) {
+	case 0:
+		panic("internal error: packIndexExpr with empty expr slice")
+	case 1:
+		return &ast.IndexExpr{
+			X:      x,
+			Lbrack: lbrack,
+			Index:  exprs[0],
+			Rbrack: rbrack,
+		}
+	default:
+		return &ast.IndexListExpr{
+			X:       x,
+			Lbrack:  lbrack,
+			Indices: exprs,
+			Rbrack:  rbrack,
+		}
+	}
 }

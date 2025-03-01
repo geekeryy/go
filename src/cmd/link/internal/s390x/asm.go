@@ -111,9 +111,7 @@ func adddynrel(target *ld.Target, ldr *loader.Loader, syms *ld.ArchSyms, s loade
 		if targType == sym.SDYNIMPORT {
 			ldr.Errorf(s, "unexpected R_390_PCnn relocation for dynamic symbol %s", ldr.SymName(targ))
 		}
-		// TODO(mwhudson): the test of VisibilityHidden here probably doesn't make
-		// sense and should be removed when someone has thought about it properly.
-		if (targType == 0 || targType == sym.SXREF) && !ldr.AttrVisibilityHidden(targ) {
+		if targType == 0 || targType == sym.SXREF {
 			ldr.Errorf(s, "unknown symbol %s in pcrel", ldr.SymName(targ))
 		}
 		su := ldr.MakeSymbolUpdater(s)
@@ -212,11 +210,7 @@ func adddynrel(target *ld.Target, ldr *loader.Loader, syms *ld.ArchSyms, s loade
 		return true
 	}
 	// Handle references to ELF symbols from our own object files.
-	if targType != sym.SDYNIMPORT {
-		return true
-	}
-
-	return false
+	return targType != sym.SDYNIMPORT
 }
 
 func elfreloc1(ctxt *ld.Link, out *ld.OutBuf, ldr *loader.Loader, s loader.Sym, r loader.ExtReloc, ri int, sectoff int64) bool {
@@ -315,7 +309,7 @@ func elfreloc1(ctxt *ld.Link, out *ld.OutBuf, ldr *loader.Loader, s loader.Sym, 
 	return true
 }
 
-func elfsetupplt(ctxt *ld.Link, plt, got *loader.SymbolBuilder, dynamic loader.Sym) {
+func elfsetupplt(ctxt *ld.Link, ldr *loader.Loader, plt, got *loader.SymbolBuilder, dynamic loader.Sym) {
 	if plt.Size() == 0 {
 		// stg     %r1,56(%r15)
 		plt.AddUint8(0xe3)

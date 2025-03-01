@@ -17,12 +17,12 @@ import (
 	"cmd/internal/obj/mips"
 )
 
-// isFPreg reports whether r is an FP register
+// isFPreg reports whether r is an FP register.
 func isFPreg(r int16) bool {
 	return mips.REG_F0 <= r && r <= mips.REG_F31
 }
 
-// isHILO reports whether r is HI or LO register
+// isHILO reports whether r is HI or LO register.
 func isHILO(r int16) bool {
 	return r == mips.REG_HI || r == mips.REG_LO
 }
@@ -361,8 +361,11 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		ssa.OpMIPSTRUNCDW,
 		ssa.OpMIPSMOVFD,
 		ssa.OpMIPSMOVDF,
+		ssa.OpMIPSMOVWfpgp,
+		ssa.OpMIPSMOVWgpfp,
 		ssa.OpMIPSNEGF,
 		ssa.OpMIPSNEGD,
+		ssa.OpMIPSABSD,
 		ssa.OpMIPSSQRTF,
 		ssa.OpMIPSSQRTD,
 		ssa.OpMIPSCLZ:
@@ -481,7 +484,8 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		p := s.Prog(obj.ACALL)
 		p.To.Type = obj.TYPE_MEM
 		p.To.Name = obj.NAME_EXTERN
-		p.To.Sym = v.Aux.(*obj.LSym)
+		// AuxInt encodes how many buffer entries we need.
+		p.To.Sym = ir.Syms.GCWriteBarrier[v.AuxInt-1]
 	case ssa.OpMIPSLoweredPanicBoundsA, ssa.OpMIPSLoweredPanicBoundsB, ssa.OpMIPSLoweredPanicBoundsC:
 		p := s.Prog(obj.ACALL)
 		p.To.Type = obj.TYPE_MEM
@@ -822,22 +826,7 @@ var blockJump = map[ssa.BlockKind]struct {
 
 func ssaGenBlock(s *ssagen.State, b, next *ssa.Block) {
 	switch b.Kind {
-	case ssa.BlockPlain:
-		if b.Succs[0].Block() != next {
-			p := s.Prog(obj.AJMP)
-			p.To.Type = obj.TYPE_BRANCH
-			s.Branches = append(s.Branches, ssagen.Branch{P: p, B: b.Succs[0].Block()})
-		}
-	case ssa.BlockDefer:
-		// defer returns in R1:
-		// 0 if we should continue executing
-		// 1 if we should jump to deferreturn call
-		p := s.Prog(mips.ABNE)
-		p.From.Type = obj.TYPE_REG
-		p.From.Reg = mips.REGZERO
-		p.Reg = mips.REG_R1
-		p.To.Type = obj.TYPE_BRANCH
-		s.Branches = append(s.Branches, ssagen.Branch{P: p, B: b.Succs[1].Block()})
+	case ssa.BlockPlain, ssa.BlockDefer:
 		if b.Succs[0].Block() != next {
 			p := s.Prog(obj.AJMP)
 			p.To.Type = obj.TYPE_BRANCH

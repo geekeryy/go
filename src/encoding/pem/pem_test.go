@@ -163,7 +163,7 @@ func TestCVE202224675(t *testing.T) {
 	// Prior to CVE-2022-24675, this input would cause a stack overflow.
 	input := []byte(strings.Repeat("-----BEGIN \n", 10000000))
 	result, rest := Decode(input)
-	if result != nil || !reflect.DeepEqual(rest, input) {
+	if result != nil || !bytes.Equal(rest, input) {
 		t.Errorf("Encode of %#v decoded as %#v", input, rest)
 	}
 }
@@ -192,7 +192,7 @@ var lineBreakerTests = []lineBreakerTest{
 
 func TestLineBreaker(t *testing.T) {
 	for i, test := range lineBreakerTests {
-		buf := new(bytes.Buffer)
+		buf := new(strings.Builder)
 		var breaker lineBreaker
 		breaker.out = buf
 		_, err := breaker.Write([]byte(test.in))
@@ -206,13 +206,13 @@ func TestLineBreaker(t *testing.T) {
 			continue
 		}
 
-		if string(buf.Bytes()) != test.out {
-			t.Errorf("#%d: got:%s want:%s", i, string(buf.Bytes()), test.out)
+		if got := buf.String(); got != test.out {
+			t.Errorf("#%d: got:%s want:%s", i, got, test.out)
 		}
 	}
 
 	for i, test := range lineBreakerTests {
-		buf := new(bytes.Buffer)
+		buf := new(strings.Builder)
 		var breaker lineBreaker
 		breaker.out = buf
 
@@ -229,8 +229,8 @@ func TestLineBreaker(t *testing.T) {
 			continue
 		}
 
-		if string(buf.Bytes()) != test.out {
-			t.Errorf("#%d: (byte by byte) got:%s want:%s", i, string(buf.Bytes()), test.out)
+		if got := buf.String(); got != test.out {
+			t.Errorf("#%d: (byte by byte) got:%s want:%s", i, got, test.out)
 		}
 	}
 }

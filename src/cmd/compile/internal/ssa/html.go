@@ -7,6 +7,7 @@ package ssa
 import (
 	"bytes"
 	"cmd/internal/src"
+	"cmp"
 	"fmt"
 	"html"
 	"io"
@@ -741,7 +742,7 @@ function toggleDarkMode() {
 </head>`)
 	w.WriteString("<body>")
 	w.WriteString("<h1>")
-	w.WriteString(html.EscapeString(w.Func.Name))
+	w.WriteString(html.EscapeString(w.Func.NameABI()))
 	w.WriteString("</h1>")
 	w.WriteString(`
 <a href="#" onclick="toggle_visibility('help');return false;" id="helplink">help</a>
@@ -784,7 +785,7 @@ func (w *HTMLWriter) Close() {
 	io.WriteString(w.w, "</body>")
 	io.WriteString(w.w, "</html>")
 	w.w.Close()
-	fmt.Printf("dumped SSA to %v\n", w.path)
+	fmt.Printf("dumped SSA for %s to %v\n", w.Func.NameABI(), w.path)
 }
 
 // WritePhase writes f in a column headed by title.
@@ -827,19 +828,13 @@ type FuncLines struct {
 	Lines       []string
 }
 
-// ByTopo sorts topologically: target function is on top,
+// ByTopoCmp sorts topologically: target function is on top,
 // followed by inlined functions sorted by filename and line numbers.
-type ByTopo []*FuncLines
-
-func (x ByTopo) Len() int      { return len(x) }
-func (x ByTopo) Swap(i, j int) { x[i], x[j] = x[j], x[i] }
-func (x ByTopo) Less(i, j int) bool {
-	a := x[i]
-	b := x[j]
-	if a.Filename == b.Filename {
-		return a.StartLineno < b.StartLineno
+func ByTopoCmp(a, b *FuncLines) int {
+	if r := strings.Compare(a.Filename, b.Filename); r != 0 {
+		return r
 	}
-	return a.Filename < b.Filename
+	return cmp.Compare(a.StartLineno, b.StartLineno)
 }
 
 // WriteSources writes lines as source code in a column headed by title.
@@ -848,7 +843,7 @@ func (w *HTMLWriter) WriteSources(phase string, all []*FuncLines) {
 	if w == nil {
 		return // avoid generating HTML just to discard it
 	}
-	var buf bytes.Buffer
+	var buf strings.Builder
 	fmt.Fprint(&buf, "<div class=\"lines\" style=\"width: 8%\">")
 	filename := ""
 	for _, fl := range all {
@@ -890,7 +885,7 @@ func (w *HTMLWriter) WriteAST(phase string, buf *bytes.Buffer) {
 		return // avoid generating HTML just to discard it
 	}
 	lines := strings.Split(buf.String(), "\n")
-	var out bytes.Buffer
+	var out strings.Builder
 
 	fmt.Fprint(&out, "<div>")
 	for _, l := range lines {
@@ -994,6 +989,9 @@ func (v *Value) LongHTML() string {
 	if int(v.ID) < len(r) && r[v.ID] != nil {
 		s += " : " + html.EscapeString(r[v.ID].String())
 	}
+	if reg := v.Block.Func.tempRegs[v.ID]; reg != nil {
+		s += " tmp=" + reg.String()
+	}
 	var names []string
 	for name, values := range v.Block.Func.NamedValues {
 		for _, value := range values {
@@ -1053,7 +1051,7 @@ func (b *Block) LongHTML() string {
 }
 
 func (f *Func) HTML(phase string, dot *dotWriter) string {
-	buf := new(bytes.Buffer)
+	buf := new(strings.Builder)
 	if dot != nil {
 		dot.writeFuncSVG(buf, phase, f)
 	}
@@ -1082,7 +1080,7 @@ func (d *dotWriter) writeFuncSVG(w io.Writer, phase string, f *Func) {
 	}
 	buf := new(bytes.Buffer)
 	cmd.Stdout = buf
-	bufErr := new(bytes.Buffer)
+	bufErr := new(strings.Builder)
 	cmd.Stderr = bufErr
 	err = cmd.Start()
 	if err != nil {

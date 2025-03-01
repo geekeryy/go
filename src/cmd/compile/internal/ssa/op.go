@@ -16,7 +16,7 @@ import (
 // An Op encodes the specific operation that a Value performs.
 // Opcodes' semantics can be modified by the type and aux fields of the Value.
 // For instance, OpAdd can be 32 or 64 bit, signed or unsigned, float or complex, depending on Value.Type.
-// Semantics of each op are described in the opcode files in gen/*Ops.go.
+// Semantics of each op are described in the opcode files in _gen/*Ops.go.
 // There is one file for generic (architecture-independent) ops and one file
 // for each architecture.
 type Op int32
@@ -33,6 +33,7 @@ type opInfo struct {
 	resultInArg0      bool      // (first, if a tuple) output of v and v.Args[0] must be allocated to the same register
 	resultNotInArgs   bool      // outputs must not be allocated to the same registers as inputs
 	clobberFlags      bool      // this op clobbers flags register
+	needIntTemp       bool      // need a temporary free integer register
 	call              bool      // is a function call
 	tailCall          bool      // is a tail call
 	nilCheck          bool      // this op is a nil check on arg0
@@ -237,13 +238,9 @@ func (a *AuxCall) RegsOfArg(which int64) []abi.RegIndex {
 	return a.abiInfo.InParam(int(which)).Registers
 }
 
-// NameOfResult returns the type of result which (indexed 0, 1, etc).
+// NameOfResult returns the ir.Name of result which (indexed 0, 1, etc).
 func (a *AuxCall) NameOfResult(which int64) *ir.Name {
-	name := a.abiInfo.OutParam(int(which)).Name
-	if name == nil {
-		return nil
-	}
-	return name.(*ir.Name)
+	return a.abiInfo.OutParam(int(which)).Name
 }
 
 // TypeOfResult returns the type of result which (indexed 0, 1, etc).
@@ -268,7 +265,7 @@ func (a *AuxCall) SizeOfArg(which int64) int64 {
 	return a.TypeOfArg(which).Size()
 }
 
-// NResults returns the number of results
+// NResults returns the number of results.
 func (a *AuxCall) NResults() int64 {
 	return int64(len(a.abiInfo.OutParams()))
 }
@@ -334,7 +331,7 @@ func ClosureAuxCall(paramResultInfo *abi.ABIParamResultInfo) *AuxCall {
 
 func (*AuxCall) CanBeAnSSAAux() {}
 
-// OwnAuxCall returns a function's own AuxCall
+// OwnAuxCall returns a function's own AuxCall.
 func OwnAuxCall(fn *obj.LSym, paramResultInfo *abi.ABIParamResultInfo) *AuxCall {
 	// TODO if this remains identical to ClosureAuxCall above after new ABI is done, should deduplicate.
 	var reg *regInfo
@@ -356,6 +353,7 @@ const (
 	auxFloat32                // auxInt is a float32 (encoded with math.Float64bits)
 	auxFloat64                // auxInt is a float64 (encoded with math.Float64bits)
 	auxFlagConstant           // auxInt is a flagConstant
+	auxCCop                   // auxInt is a ssa.Op that represents a flags-to-bool conversion (e.g. LessThan)
 	auxNameOffsetInt8         // aux is a &struct{Name ir.Name, Offset int64}; auxInt is index in parameter registers array
 	auxString                 // aux is a string
 	auxSym                    // aux is a symbol (a *gc.Node for locals, an *obj.LSym for globals, or nil for none)
@@ -363,7 +361,6 @@ const (
 	auxSymValAndOff           // aux is a symbol, auxInt is a ValAndOff
 	auxTyp                    // aux is a type
 	auxTypSize                // aux is a type, auxInt is a size, must have Aux.(Type).Size() == AuxInt
-	auxCCop                   // aux is a ssa.Op that represents a flags-to-bool conversion (e.g. LessThan)
 	auxCall                   // aux is a *ssa.AuxCall
 	auxCallOff                // aux is a *ssa.AuxCall, AuxInt is int64 param (in+out) size
 
@@ -371,7 +368,7 @@ const (
 	auxARM64BitField     // aux is an arm64 bitfield lsb and width packed into auxInt
 	auxS390XRotateParams // aux is a s390x rotate parameters object encoding start bit, end bit and rotate amount
 	auxS390XCCMask       // aux is a s390x 4-bit condition code mask
-	auxS390XCCMaskInt8   // aux is a s390x 4-bit condition code mask, auxInt is a int8 immediate
+	auxS390XCCMaskInt8   // aux is a s390x 4-bit condition code mask, auxInt is an int8 immediate
 	auxS390XCCMaskUint8  // aux is a s390x 4-bit condition code mask, auxInt is a uint8 immediate
 )
 
@@ -478,7 +475,7 @@ const (
 	BoundsKindCount
 )
 
-// boundsAPI determines which register arguments a bounds check call should use. For an [a:b:c] slice, we do:
+// boundsABI determines which register arguments a bounds check call should use. For an [a:b:c] slice, we do:
 //
 //	CMPQ c, cap
 //	JA   fail1
@@ -525,7 +522,7 @@ func boundsABI(b int64) int {
 	}
 }
 
-// arm64BitFileld is the GO type of ARM64BitField auxInt.
+// arm64BitField is the GO type of ARM64BitField auxInt.
 // if x is an ARM64BitField, then width=x&0xff, lsb=(x>>8)&0xff, and
 // width+lsb<64 for 64-bit variant, width+lsb<32 for 32-bit variant.
 // the meaning of width and lsb are instruction-dependent.

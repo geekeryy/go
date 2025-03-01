@@ -41,8 +41,20 @@ All `g`, `m`, and `p` objects are heap allocated, but are never freed,
 so their memory remains type stable. As a result, the runtime can
 avoid write barriers in the depths of the scheduler.
 
-User stacks and system stacks
------------------------------
+`getg()` and `getg().m.curg`
+----------------------------
+
+To get the current user `g`, use `getg().m.curg`.
+
+`getg()` alone returns the current `g`, but when executing on the
+system or signal stacks, this will return the current M's "g0" or
+"gsignal", respectively. This is usually not what you want.
+
+To determine if you're running on the user stack or the system stack,
+use `getg() == getg().m.curg`.
+
+Stacks
+======
 
 Every non-dead G has a *user stack* associated with it, which is what
 user Go code executes on. User stacks start small (e.g., 2K) and grow
@@ -63,17 +75,33 @@ non-preemptible and the garbage collector does not scan system stacks.
 While running on the system stack, the current user stack is not used
 for execution.
 
-`getg()` and `getg().m.curg`
-----------------------------
+nosplit functions
+-----------------
 
-To get the current user `g`, use `getg().m.curg`.
+Most functions start with a prologue that inspects the stack pointer
+and the current G's stack bound and calls `morestack` if the stack
+needs to grow.
 
-`getg()` alone returns the current `g`, but when executing on the
-system or signal stacks, this will return the current M's "g0" or
-"gsignal", respectively. This is usually not what you want.
+Functions can be marked `//go:nosplit` (or `NOSPLIT` in assembly) to
+indicate that they should not get this prologue. This has several
+uses:
 
-To determine if you're running on the user stack or the system stack,
-use `getg() == getg().m.curg`.
+- Functions that must run on the user stack, but must not call into
+  stack growth, for example because this would cause a deadlock, or
+  because they have untyped words on the stack.
+
+- Functions that must not be preempted on entry.
+
+- Functions that may run without a valid G. For example, functions
+  that run in early runtime start-up, or that may be entered from C
+  code such as cgo callbacks or the signal handler.
+
+Splittable functions ensure there's some amount of space on the stack
+for nosplit functions to run in and the linker checks that any static
+chain of nosplit function calls cannot exceed this bound.
+
+Any function with a `//go:nosplit` annotation should explain why it is
+nosplit in its documentation comment.
 
 Error handling and reporting
 ============================
@@ -97,7 +125,7 @@ For runtime error debugging, it may be useful to run with `GOTRACEBACK=system`
 or `GOTRACEBACK=crash`. The output of `panic` and `fatal` is as described by
 `GOTRACEBACK`. The output of `throw` always includes runtime frames, metadata
 and all goroutines regardless of `GOTRACEBACK` (i.e., equivalent to
-`GOTRACEBACK=system). Whether `throw` crashes or not is still controlled by
+`GOTRACEBACK=system`). Whether `throw` crashes or not is still controlled by
 `GOTRACEBACK`.
 
 Synchronization
@@ -145,7 +173,7 @@ In summary,
 Atomics
 =======
 
-The runtime uses its own atomics package at `runtime/internal/atomic`.
+The runtime uses its own atomics package at `internal/runtime/atomic`.
 This corresponds to `sync/atomic`, but functions have different names
 for historical reasons and there are a few additional functions needed
 by the runtime.
@@ -207,7 +235,7 @@ There are three mechanisms for allocating unmanaged memory:
   objects of the same type.
 
 In general, types that are allocated using any of these should be
-marked `//go:notinheap` (see below).
+marked as not in heap by embedding `internal/runtime/sys.NotInHeap`.
 
 Objects that are allocated in unmanaged memory **must not** contain
 heap pointers unless the following rules are also obeyed:
@@ -303,36 +331,68 @@ The conversion from pointer to uintptr must appear in the argument list of any
 call to this function. This directive is used for some low-level system call
 implementations.
 
-go:notinheap
-------------
+Execution tracer
+================
 
-`go:notinheap` applies to type declarations. It indicates that a type
-must never be allocated from the GC'd heap or on the stack.
-Specifically, pointers to this type must always fail the
-`runtime.inheap` check. The type may be used for global variables, or
-for objects in unmanaged memory (e.g., allocated with `sysAlloc`,
-`persistentalloc`, `fixalloc`, or from a manually-managed span).
-Specifically:
+The execution tracer is a way for users to see what their goroutines are doing,
+but they're also useful for runtime hacking.
 
-1. `new(T)`, `make([]T)`, `append([]T, ...)` and implicit heap
-   allocation of T are disallowed. (Though implicit allocations are
-   disallowed in the runtime anyway.)
+Using execution traces to debug runtime problems
+------------------------------------------------
 
-2. A pointer to a regular type (other than `unsafe.Pointer`) cannot be
-   converted to a pointer to a `go:notinheap` type, even if they have
-   the same underlying type.
+Execution traces contain a wealth of information about what the runtime is
+doing. They contain all goroutine scheduling actions, data about time spent in
+the scheduler (P running without a G), data about time spent in the garbage
+collector, and more. Use `go tool trace` or [gotraceui](https://gotraceui.dev)
+to inspect traces.
 
-3. Any type that contains a `go:notinheap` type is itself
-   `go:notinheap`. Structs and arrays are `go:notinheap` if their
-   elements are. Maps and channels of `go:notinheap` types are
-   disallowed. To keep things explicit, any type declaration where the
-   type is implicitly `go:notinheap` must be explicitly marked
-   `go:notinheap` as well.
+Traces are especially useful for debugging latency issues, and especially if you
+can catch the problem in the act. Consider using the flight recorder to help
+with this.
 
-4. Write barriers on pointers to `go:notinheap` types can be omitted.
+Turn on CPU profiling when you take a trace. This will put the CPU profiling
+samples as timestamped events into the trace, allowing you to see execution with
+greater detail. If you see CPU profiling sample events appear at a rate that does
+not match the sample rate, consider that the OS or platform might be taking away
+CPU time from the process, and that you might not be debugging a Go issue.
 
-The last point is the real benefit of `go:notinheap`. The runtime uses
-it for low-level internal structures to avoid memory barriers in the
-scheduler and the memory allocator where they are illegal or simply
-inefficient. This mechanism is reasonably safe and does not compromise
-the readability of the runtime.
+If you're really stuck on a problem, adding new instrumentation with the tracer
+might help, especially if it's helpful to see events in relation to other
+scheduling events. See the next section on modifying the execution tracer.
+However, consider using `debuglog` for additional instrumentation first, as that
+is far easier to get started with.
+
+Notes on modifying the execution tracer
+---------------------------------------
+
+The execution tracer lives in the files whose names start with "trace."
+The parser for the execution trace format lives in the `internal/trace` package.
+
+If you plan on adding new trace events, consider starting with a [trace
+experiment](../internal/trace/tracev2/EXPERIMENTS.md).
+
+If you plan to add new trace instrumentation to the runtime, wrap whatever operation
+you're tracing in `traceAcquire` and `traceRelease` fully. These functions mark a
+critical section that appears atomic to the execution tracer (but nothing else).
+
+debuglog
+========
+
+`debuglog` is a powerful runtime-only debugging tool. Think of it as an
+ultra-low-overhead `println` that works just about anywhere in the runtime.
+These properties are invaluable when debugging subtle problems in tricky parts
+of the codebase. `println` can often perturb code enough to stop data races from
+happening, while `debuglog` perturbs execution far less.
+
+`debuglog` accumulates log messages in a ring buffer on each M, and dumps out
+the contents, ordering it by timestamp, on certain kinds of crashes. Some messages
+might be lost if the ring buffer gets full, in which case consider increasing the
+size, or just work with a partial log.
+
+1. Add `debuglog` instrumentation to the runtime. Don't forget to call `end`!
+   Example: `dlog().s("hello world").u32(5).end()`
+2. By default, `debuglog` only dumps its contents in certain kinds of crashes.
+   Consider adding more calls to `printDebugLog` if you're not getting any output.
+3. Build the program you wish to debug with the `debuglog` build tag.
+
+`debuglog` is lower level than execution traces, and much easier to set up.

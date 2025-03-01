@@ -244,6 +244,10 @@ var parseTests = []parseTest{
 		`{{with .X}}"hello"{{end}}`},
 	{"with with else", "{{with .X}}hello{{else}}goodbye{{end}}", noError,
 		`{{with .X}}"hello"{{else}}"goodbye"{{end}}`},
+	{"with with else with", "{{with .X}}hello{{else with .Y}}goodbye{{end}}", noError,
+		`{{with .X}}"hello"{{else}}{{with .Y}}"goodbye"{{end}}{{end}}`},
+	{"with else chain", "{{with .X}}X{{else with .Y}}Y{{else with .Z}}Z{{end}}", noError,
+		`{{with .X}}"X"{{else}}{{with .Y}}"Y"{{else}}{{with .Z}}"Z"{{end}}{{end}}{{end}}`},
 	// Trimming spaces.
 	{"trim left", "x \r\n\t{{- 3}}", noError, `"x"{{3}}`},
 	{"trim right", "{{3 -}}\n\n\ty", noError, `{{3}}"y"`},
@@ -302,6 +306,9 @@ var parseTests = []parseTest{
 	{"bug1a", "{{$x:=.}}{{$x!2}}", hasError, ""},                     // ! is just illegal here.
 	{"bug1b", "{{$x:=.}}{{$x+2}}", hasError, ""},                     // $x+2 should not parse as ($x) (+2).
 	{"bug1c", "{{$x:=.}}{{$x +2}}", noError, "{{$x := .}}{{$x +2}}"}, // It's OK with a space.
+	// Check the range handles assignment vs. declaration properly.
+	{"bug2a", "{{range $x := 0}}{{$x}}{{end}}", noError, "{{range $x := 0}}{{$x}}{{end}}"},
+	{"bug2b", "{{range $x = 0}}{{$x}}{{end}}", noError, "{{range $x = 0}}{{$x}}{{end}}"},
 	// dot following a literal value
 	{"dot after integer", "{{1.E}}", hasError, ""},
 	{"dot after float", "{{0.1.E}}", hasError, ""},
@@ -388,6 +395,36 @@ func TestParseWithComments(t *testing.T) {
 				t.Errorf("%s=(%q): got\n\t%v\nexpected\n\t%v", test.name, test.input, result, test.result)
 			}
 		})
+	}
+}
+
+func TestKeywordsAndFuncs(t *testing.T) {
+	// Check collisions between functions and new keywords like 'break'. When a
+	// break function is provided, the parser should treat 'break' as a function,
+	// not a keyword.
+	textFormat = "%q"
+	defer func() { textFormat = "%s" }()
+
+	inp := `{{range .X}}{{break 20}}{{end}}`
+	{
+		// 'break' is a defined function, don't treat it as a keyword: it should
+		// accept an argument successfully.
+		var funcsWithKeywordFunc = map[string]any{
+			"break": func(in any) any { return in },
+		}
+		tmpl, err := New("").Parse(inp, "", "", make(map[string]*Tree), funcsWithKeywordFunc)
+		if err != nil || tmpl == nil {
+			t.Errorf("with break func: unexpected error: %v", err)
+		}
+	}
+
+	{
+		// No function called 'break'; treat it as a keyword. Results in a parse
+		// error.
+		tmpl, err := New("").Parse(inp, "", "", make(map[string]*Tree), make(map[string]any))
+		if err == nil || tmpl != nil {
+			t.Errorf("without break func: expected error; got none")
+		}
 	}
 }
 
@@ -489,7 +526,7 @@ var errorTests = []parseTest{
 		hasError, `unclosed left paren`},
 	{"rparen",
 		"{{.X 1 2 3 ) }}",
-		hasError, `unexpected ")" in command`},
+		hasError, "unexpected right paren"},
 	{"rparen2",
 		"{{(.X 1 2 3",
 		hasError, `unclosed action`},
@@ -597,7 +634,8 @@ func TestBlock(t *testing.T) {
 }
 
 func TestLineNum(t *testing.T) {
-	const count = 100
+	// const count = 100
+	const count = 3
 	text := strings.Repeat("{{printf 1234}}\n", count)
 	tree, err := New("bench").Parse(text, "", "", make(map[string]*Tree), builtins)
 	if err != nil {
@@ -611,11 +649,11 @@ func TestLineNum(t *testing.T) {
 		// Action first.
 		action := nodes[i].(*ActionNode)
 		if action.Line != line {
-			t.Fatalf("line %d: action is line %d", line, action.Line)
+			t.Errorf("line %d: action is line %d", line, action.Line)
 		}
 		pipe := action.Pipe
 		if pipe.Line != line {
-			t.Fatalf("line %d: pipe is line %d", line, pipe.Line)
+			t.Errorf("line %d: pipe is line %d", line, pipe.Line)
 		}
 	}
 }

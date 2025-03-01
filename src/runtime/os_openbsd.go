@@ -6,7 +6,7 @@ package runtime
 
 import (
 	"internal/abi"
-	"runtime/internal/atomic"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
@@ -32,9 +32,6 @@ var sigset_all = ^sigset(0)
 
 // From OpenBSD's <sys/sysctl.h>
 const (
-	_CTL_KERN   = 1
-	_KERN_OSREV = 3
-
 	_CTL_HW        = 6
 	_HW_NCPU       = 3
 	_HW_PAGESIZE   = 7
@@ -49,6 +46,21 @@ func sysctlInt(mib []uint32) (int32, bool) {
 		return 0, false
 	}
 	return out, true
+}
+
+func sysctlUint64(mib []uint32) (uint64, bool) {
+	var out uint64
+	nout := unsafe.Sizeof(out)
+	ret := sysctl(&mib[0], uint32(len(mib)), (*byte)(unsafe.Pointer(&out)), &nout, nil, 0)
+	if ret < 0 {
+		return 0, false
+	}
+	return out, true
+}
+
+//go:linkname internal_cpu_sysctlUint64 internal/cpu.sysctlUint64
+func internal_cpu_sysctlUint64(mib []uint32) (uint64, bool) {
+	return sysctlUint64(mib)
 }
 
 func getncpu() int32 {
@@ -71,20 +83,13 @@ func getPageSize() uintptr {
 	return 0
 }
 
-func getOSRev() int {
-	if osrev, ok := sysctlInt([]uint32{_CTL_KERN, _KERN_OSREV}); ok {
-		return int(osrev)
-	}
-	return 0
-}
-
 //go:nosplit
 func semacreate(mp *m) {
 }
 
 //go:nosplit
 func semasleep(ns int64) int32 {
-	_g_ := getg()
+	gp := getg()
 
 	// Compute sleep deadline.
 	var tsp *timespec
@@ -95,9 +100,9 @@ func semasleep(ns int64) int32 {
 	}
 
 	for {
-		v := atomic.Load(&_g_.m.waitsemacount)
+		v := atomic.Load(&gp.m.waitsemacount)
 		if v > 0 {
-			if atomic.Cas(&_g_.m.waitsemacount, v, v-1) {
+			if atomic.Cas(&gp.m.waitsemacount, v, v-1) {
 				return 0 // semaphore acquired
 			}
 			continue
@@ -110,7 +115,7 @@ func semasleep(ns int64) int32 {
 		// be examined [...] immediately before blocking. If that int
 		// is non-zero then __thrsleep() will immediately return EINTR
 		// without blocking."
-		ret := thrsleep(uintptr(unsafe.Pointer(&_g_.m.waitsemacount)), _CLOCK_MONOTONIC, tsp, 0, &_g_.m.waitsemacount)
+		ret := thrsleep(uintptr(unsafe.Pointer(&gp.m.waitsemacount)), _CLOCK_MONOTONIC, tsp, 0, &gp.m.waitsemacount)
 		if ret == _EWOULDBLOCK {
 			return -1
 		}
@@ -132,17 +137,19 @@ func semawakeup(mp *m) {
 func osinit() {
 	ncpu = getncpu()
 	physPageSize = getPageSize()
-	haveMapStack = getOSRev() >= 201805 // OpenBSD 6.3
 }
+
+// TODO(#69781): set startupRand using the .openbsd.randomdata ELF section.
+// See SPECS.randomdata.
 
 var urandom_dev = []byte("/dev/urandom\x00")
 
 //go:nosplit
-func getRandomData(r []byte) {
+func readRandom(r []byte) int {
 	fd := open(&urandom_dev[0], 0 /* O_RDONLY */, 0)
 	n := read(fd, unsafe.Pointer(&r[0]), int32(len(r)))
 	closefd(fd)
-	extendRandom(r, int(n))
+	return int(n)
 }
 
 func goenvs() {
@@ -172,6 +179,7 @@ func minit() {
 //go:nosplit
 func unminit() {
 	unminitSignals()
+	getg().m.procid = 0
 }
 
 // Called from exitm, but not from drop, to undo the effect of thread-owned
@@ -214,7 +222,7 @@ func getsig(i uint32) uintptr {
 	return sa.sa_sigaction
 }
 
-// setSignaltstackSP sets the ss_sp field of a stackt.
+// setSignalstackSP sets the ss_sp field of a stackt.
 //
 //go:nosplit
 func setSignalstackSP(s *stackt, sp uintptr) {
@@ -248,15 +256,7 @@ func validSIGPROF(mp *m, c *sigctxt) bool {
 	return true
 }
 
-var haveMapStack = false
-
 func osStackAlloc(s *mspan) {
-	// OpenBSD 6.4+ requires that stacks be mapped with MAP_STACK.
-	// It will check this on entry to system calls, traps, and
-	// when switching to the alternate system stack.
-	//
-	// This function is called before s is used for any data, so
-	// it's safe to simply re-map it.
 	osStackRemap(s, _MAP_STACK)
 }
 
@@ -266,13 +266,6 @@ func osStackFree(s *mspan) {
 }
 
 func osStackRemap(s *mspan, flags int32) {
-	if !haveMapStack {
-		// OpenBSD prior to 6.3 did not have MAP_STACK and so
-		// the following mmap will fail. But it also didn't
-		// require MAP_STACK (obviously), so there's no need
-		// to do the mmap.
-		return
-	}
 	a, err := mmap(unsafe.Pointer(s.base()), s.npages*pageSize, _PROT_READ|_PROT_WRITE, _MAP_PRIVATE|_MAP_ANON|_MAP_FIXED|flags, -1, 0)
 	if err != 0 || uintptr(a) != s.base() {
 		print("runtime: remapping stack memory ", hex(s.base()), " ", s.npages*pageSize, " a=", a, " err=", err, "\n")

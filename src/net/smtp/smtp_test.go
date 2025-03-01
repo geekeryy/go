@@ -113,7 +113,7 @@ func TestAuthPlain(t *testing.T) {
 func TestClientAuthTrimSpace(t *testing.T) {
 	server := "220 hello world\r\n" +
 		"200 some more"
-	var wrote bytes.Buffer
+	var wrote strings.Builder
 	var fake faker
 	fake.ReadWriter = struct {
 		io.Reader
@@ -164,7 +164,7 @@ func TestBasic(t *testing.T) {
 	server := strings.Join(strings.Split(basicServer, "\n"), "\r\n")
 	client := strings.Join(strings.Split(basicClient, "\n"), "\r\n")
 
-	var cmdbuf bytes.Buffer
+	var cmdbuf strings.Builder
 	bcmdbuf := bufio.NewWriter(&cmdbuf)
 	var fake faker
 	fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
@@ -287,6 +287,37 @@ Goodbye.
 .
 QUIT
 `
+
+func TestHELOFailed(t *testing.T) {
+	serverLines := `502 EH?
+502 EH?
+221 OK
+`
+	clientLines := `EHLO localhost
+HELO localhost
+QUIT
+`
+
+	server := strings.Join(strings.Split(serverLines, "\n"), "\r\n")
+	client := strings.Join(strings.Split(clientLines, "\n"), "\r\n")
+	var cmdbuf strings.Builder
+	bcmdbuf := bufio.NewWriter(&cmdbuf)
+	var fake faker
+	fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
+	c := &Client{Text: textproto.NewConn(fake), localName: "localhost"}
+
+	if err := c.Hello("localhost"); err == nil {
+		t.Fatal("expected EHLO to fail")
+	}
+	if err := c.Quit(); err != nil {
+		t.Errorf("QUIT failed: %s", err)
+	}
+	bcmdbuf.Flush()
+	actual := cmdbuf.String()
+	if client != actual {
+		t.Errorf("Got:\n%s\nWant:\n%s", actual, client)
+	}
+}
 
 func TestExtensions(t *testing.T) {
 	fake := func(server string) (c *Client, bcmdbuf *bufio.Writer, cmdbuf *strings.Builder) {
@@ -505,7 +536,7 @@ func TestNewClient(t *testing.T) {
 	server := strings.Join(strings.Split(newClientServer, "\n"), "\r\n")
 	client := strings.Join(strings.Split(newClientClient, "\n"), "\r\n")
 
-	var cmdbuf bytes.Buffer
+	var cmdbuf strings.Builder
 	bcmdbuf := bufio.NewWriter(&cmdbuf)
 	out := func() string {
 		bcmdbuf.Flush()
@@ -550,7 +581,7 @@ func TestNewClient2(t *testing.T) {
 	server := strings.Join(strings.Split(newClient2Server, "\n"), "\r\n")
 	client := strings.Join(strings.Split(newClient2Client, "\n"), "\r\n")
 
-	var cmdbuf bytes.Buffer
+	var cmdbuf strings.Builder
 	bcmdbuf := bufio.NewWriter(&cmdbuf)
 	var fake faker
 	fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
@@ -643,7 +674,7 @@ func TestHello(t *testing.T) {
 	for i := 0; i < len(helloServer); i++ {
 		server := strings.Join(strings.Split(baseHelloServer+helloServer[i], "\n"), "\r\n")
 		client := strings.Join(strings.Split(baseHelloClient+helloClient[i], "\n"), "\r\n")
-		var cmdbuf bytes.Buffer
+		var cmdbuf strings.Builder
 		bcmdbuf := bufio.NewWriter(&cmdbuf)
 		var fake faker
 		fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
@@ -749,7 +780,7 @@ var helloClient = []string{
 func TestSendMail(t *testing.T) {
 	server := strings.Join(strings.Split(sendMailServer, "\n"), "\r\n")
 	client := strings.Join(strings.Split(sendMailClient, "\n"), "\r\n")
-	var cmdbuf bytes.Buffer
+	var cmdbuf strings.Builder
 	bcmdbuf := bufio.NewWriter(&cmdbuf)
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -772,10 +803,10 @@ func TestSendMail(t *testing.T) {
 
 		tc := textproto.NewConn(conn)
 		for i := 0; i < len(data) && data[i] != ""; i++ {
-			tc.PrintfLine(data[i])
+			tc.PrintfLine("%s", data[i])
 			for len(data[i]) >= 4 && data[i][3] == '-' {
 				i++
-				tc.PrintfLine(data[i])
+				tc.PrintfLine("%s", data[i])
 			}
 			if data[i] == "221 Goodbye" {
 				return
@@ -906,7 +937,7 @@ SendMail is working for me.
 func TestAuthFailed(t *testing.T) {
 	server := strings.Join(strings.Split(authFailedServer, "\n"), "\r\n")
 	client := strings.Join(strings.Split(authFailedClient, "\n"), "\r\n")
-	var cmdbuf bytes.Buffer
+	var cmdbuf strings.Builder
 	bcmdbuf := bufio.NewWriter(&cmdbuf)
 	var fake faker
 	fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
@@ -948,7 +979,7 @@ QUIT
 `
 
 func TestTLSClient(t *testing.T) {
-	if runtime.GOOS == "freebsd" || runtime.GOOS == "js" {
+	if runtime.GOOS == "freebsd" || runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
 		testenv.SkipFlaky(t, 19229)
 	}
 	ln := newLocalListener(t)

@@ -94,6 +94,18 @@ func DoChildren(n Node, do func(Node) bool) bool {
 	return n.doChildren(do)
 }
 
+// DoChildrenWithHidden is like DoChildren, but also visits
+// Node-typed fields tagged with `mknode:"-"`.
+//
+// TODO(mdempsky): Remove the `mknode:"-"` tags so this function can
+// go away.
+func DoChildrenWithHidden(n Node, do func(Node) bool) bool {
+	if n == nil {
+		return false
+	}
+	return n.doChildrenWithHidden(do)
+}
+
 // Visit visits each non-nil node x in the IR tree rooted at n
 // in a depth-first preorder traversal, calling visit on each node visited.
 func Visit(n Node, visit func(Node)) {
@@ -113,6 +125,17 @@ func VisitList(list Nodes, visit func(Node)) {
 	for _, x := range list {
 		Visit(x, visit)
 	}
+}
+
+// VisitFuncAndClosures calls visit on each non-nil node in fn.Body,
+// including any nested closure bodies.
+func VisitFuncAndClosures(fn *Func, visit func(n Node)) {
+	VisitList(fn.Body, func(n Node) {
+		visit(n)
+		if n, ok := n.(*ClosureExpr); ok && n.Op() == OCLOSURE {
+			VisitFuncAndClosures(n.Func, visit)
+		}
+	})
 }
 
 // Any looks for a non-nil node x in the IR tree rooted at n
@@ -183,4 +206,16 @@ func EditChildren(n Node, edit func(Node) Node) {
 		return
 	}
 	n.editChildren(edit)
+}
+
+// EditChildrenWithHidden is like EditChildren, but also edits
+// Node-typed fields tagged with `mknode:"-"`.
+//
+// TODO(mdempsky): Remove the `mknode:"-"` tags so this function can
+// go away.
+func EditChildrenWithHidden(n Node, edit func(Node) Node) {
+	if n == nil {
+		return
+	}
+	n.editChildrenWithHidden(edit)
 }

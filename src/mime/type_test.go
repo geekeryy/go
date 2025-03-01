@@ -5,7 +5,8 @@
 package mime
 
 import (
-	"reflect"
+	"internal/asan"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -14,7 +15,10 @@ import (
 func setMimeInit(fn func()) (cleanup func()) {
 	once = sync.Once{}
 	testInitMime = fn
-	return func() { testInitMime = nil }
+	return func() {
+		testInitMime = nil
+		once = sync.Once{}
+	}
 }
 
 func clearMimeTypes() {
@@ -133,13 +137,16 @@ func TestExtensionsByType(t *testing.T) {
 			t.Errorf("ExtensionsByType(%q) = %q, %v; want error substring %q", tt.typ, got, err, tt.wantErr)
 			continue
 		}
-		if !reflect.DeepEqual(got, tt.want) {
+		if !slices.Equal(got, tt.want) {
 			t.Errorf("ExtensionsByType(%q) = %q; want %q", tt.typ, got, tt.want)
 		}
 	}
 }
 
 func TestLookupMallocs(t *testing.T) {
+	if asan.Enabled {
+		t.Skip("test allocates more with -asan; see #70079")
+	}
 	n := testing.AllocsPerRun(10000, func() {
 		TypeByExtension(".html")
 		TypeByExtension(".HtML")
@@ -210,7 +217,7 @@ func TestExtensionsByType2(t *testing.T) {
 			t.Errorf("ExtensionsByType(%q): %v", tt.typ, err)
 			continue
 		}
-		if !reflect.DeepEqual(got, tt.want) {
+		if !slices.Equal(got, tt.want) {
 			t.Errorf("ExtensionsByType(%q) = %q; want %q", tt.typ, got, tt.want)
 		}
 	}

@@ -60,21 +60,21 @@ func typefix(f *ast.File, badType func(string) bool) bool {
 	// There's no easy way to map from an ast.Expr to all the places that use them, so
 	// we use reflect to find all such references.
 	if len(badNils) > 0 {
-		exprType := reflect.TypeOf((*ast.Expr)(nil)).Elem()
-		exprSliceType := reflect.TypeOf(([]ast.Expr)(nil))
+		exprType := reflect.TypeFor[ast.Expr]()
+		exprSliceType := reflect.TypeFor[[]ast.Expr]()
 		walk(f, func(n any) {
 			if n == nil {
 				return
 			}
 			v := reflect.ValueOf(n)
-			if v.Type().Kind() != reflect.Pointer {
+			if v.Kind() != reflect.Pointer {
 				return
 			}
 			if v.IsNil() {
 				return
 			}
 			v = v.Elem()
-			if v.Type().Kind() != reflect.Struct {
+			if v.Kind() != reflect.Struct {
 				return
 			}
 			for i := 0; i < v.NumField(); i++ {

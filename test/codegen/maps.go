@@ -66,6 +66,28 @@ func LookupStringConversionKeyedArrayLit(m map[[2]string]int, bytes []byte) int 
 	return m[[2]string{0: string(bytes)}]
 }
 
+func LookupStringConversion1(m map[string]int, bytes []byte) int {
+	// amd64:-`.*runtime\.slicebytetostring\(`
+	s := string(bytes)
+	return m[s]
+}
+func LookupStringConversion2(m *map[string]int, bytes []byte) int {
+	// amd64:-`.*runtime\.slicebytetostring\(`
+	s := string(bytes)
+	return (*m)[s]
+}
+func LookupStringConversion3(m map[string]int, bytes []byte) (int, bool) {
+	// amd64:-`.*runtime\.slicebytetostring\(`
+	s := string(bytes)
+	r, ok := m[s]
+	return r, ok
+}
+func DeleteStringConversion(m map[string]int, bytes []byte) {
+	// amd64:-`.*runtime\.slicebytetostring\(`
+	s := string(bytes)
+	delete(m, s)
+}
+
 // ------------------- //
 //     Map Clear       //
 // ------------------- //
@@ -74,7 +96,7 @@ func LookupStringConversionKeyedArrayLit(m map[[2]string]int, bytes []byte) int 
 
 func MapClearReflexive(m map[int]int) {
 	// amd64:`.*runtime\.mapclear`
-	// amd64:-`.*runtime\.mapiterinit`
+	// amd64:-`.*runtime\.(mapiterinit|mapIterStart)`
 	for k := range m {
 		delete(m, k)
 	}
@@ -83,7 +105,7 @@ func MapClearReflexive(m map[int]int) {
 func MapClearIndirect(m map[int]int) {
 	s := struct{ m map[int]int }{m: m}
 	// amd64:`.*runtime\.mapclear`
-	// amd64:-`.*runtime\.mapiterinit`
+	// amd64:-`.*runtime\.(mapiterinit|mapIterStart)`
 	for k := range s.m {
 		delete(s.m, k)
 	}
@@ -91,14 +113,14 @@ func MapClearIndirect(m map[int]int) {
 
 func MapClearPointer(m map[*byte]int) {
 	// amd64:`.*runtime\.mapclear`
-	// amd64:-`.*runtime\.mapiterinit`
+	// amd64:-`.*runtime\.(mapiterinit|mapIterStart)`
 	for k := range m {
 		delete(m, k)
 	}
 }
 
 func MapClearNotReflexive(m map[float64]int) {
-	// amd64:`.*runtime\.mapiterinit`
+	// amd64:`.*runtime\.(mapiterinit|mapIterStart)`
 	// amd64:-`.*runtime\.mapclear`
 	for k := range m {
 		delete(m, k)
@@ -106,7 +128,7 @@ func MapClearNotReflexive(m map[float64]int) {
 }
 
 func MapClearInterface(m map[interface{}]int) {
-	// amd64:`.*runtime\.mapiterinit`
+	// amd64:`.*runtime\.(mapiterinit|mapIterStart)`
 	// amd64:-`.*runtime\.mapclear`
 	for k := range m {
 		delete(m, k)
@@ -115,7 +137,7 @@ func MapClearInterface(m map[interface{}]int) {
 
 func MapClearSideEffect(m map[int]int) int {
 	k := 0
-	// amd64:`.*runtime\.mapiterinit`
+	// amd64:`.*runtime\.(mapiterinit|mapIterStart)`
 	// amd64:-`.*runtime\.mapclear`
 	for k = range m {
 		delete(m, k)
@@ -124,31 +146,78 @@ func MapClearSideEffect(m map[int]int) int {
 }
 
 func MapLiteralSizing(x int) (map[int]int, map[int]int) {
-	// amd64:"MOVL\t[$]10,"
+	// This is tested for internal/abi/maps.go:MapBucketCountBits={3,4,5}
+	// amd64:"MOVL\t[$]33,"
 	m := map[int]int{
-		0: 0,
-		1: 1,
-		2: 2,
-		3: 3,
-		4: 4,
-		5: 5,
-		6: 6,
-		7: 7,
-		8: 8,
-		9: 9,
+		0:  0,
+		1:  1,
+		2:  2,
+		3:  3,
+		4:  4,
+		5:  5,
+		6:  6,
+		7:  7,
+		8:  8,
+		9:  9,
+		10: 10,
+		11: 11,
+		12: 12,
+		13: 13,
+		14: 14,
+		15: 15,
+		16: 16,
+		17: 17,
+		18: 18,
+		19: 19,
+		20: 20,
+		21: 21,
+		22: 22,
+		23: 23,
+		24: 24,
+		25: 25,
+		26: 26,
+		27: 27,
+		28: 28,
+		29: 29,
+		30: 30,
+		31: 32,
+		32: 32,
 	}
-	// amd64:"MOVL\t[$]10,"
+	// amd64:"MOVL\t[$]33,"
 	n := map[int]int{
-		0: x,
-		1: x,
-		2: x,
-		3: x,
-		4: x,
-		5: x,
-		6: x,
-		7: x,
-		8: x,
-		9: x,
+		0:  0,
+		1:  1,
+		2:  2,
+		3:  3,
+		4:  4,
+		5:  5,
+		6:  6,
+		7:  7,
+		8:  8,
+		9:  9,
+		10: 10,
+		11: 11,
+		12: 12,
+		13: 13,
+		14: 14,
+		15: 15,
+		16: 16,
+		17: 17,
+		18: 18,
+		19: 19,
+		20: 20,
+		21: 21,
+		22: 22,
+		23: 23,
+		24: 24,
+		25: 25,
+		26: 26,
+		27: 27,
+		28: 28,
+		29: 29,
+		30: 30,
+		31: 32,
+		32: 32,
 	}
 	return m, n
 }

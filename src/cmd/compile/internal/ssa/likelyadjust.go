@@ -73,20 +73,6 @@ type loopnest struct {
 	initializedChildren, initializedDepth, initializedExits bool
 }
 
-func min8(a, b int8) int8 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max8(a, b int8) int8 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 const (
 	blDEFAULT = 0
 	blMin     = blDEFAULT
@@ -117,8 +103,10 @@ func likelyadjust(f *Func) {
 	// in their rank order.  0 is default, more positive
 	// is less likely. It's possible to assign a negative
 	// unlikeliness (though not currently the case).
-	certain := make([]int8, f.NumBlocks()) // In the long run, all outcomes are at least this bad. Mainly for Exit
-	local := make([]int8, f.NumBlocks())   // for our immediate predecessors.
+	certain := f.Cache.allocInt8Slice(f.NumBlocks()) // In the long run, all outcomes are at least this bad. Mainly for Exit
+	defer f.Cache.freeInt8Slice(certain)
+	local := f.Cache.allocInt8Slice(f.NumBlocks()) // for our immediate predecessors.
+	defer f.Cache.freeInt8Slice(local)
 
 	po := f.postorder()
 	nest := f.loopnest()
@@ -141,7 +129,7 @@ func likelyadjust(f *Func) {
 			// and less influential than inferences from loop structure.
 		case BlockDefer:
 			local[b.ID] = blCALL
-			certain[b.ID] = max8(blCALL, certain[b.Succs[0].b.ID])
+			certain[b.ID] = max(blCALL, certain[b.Succs[0].b.ID])
 
 		default:
 			if len(b.Succs) == 1 {
@@ -155,7 +143,7 @@ func likelyadjust(f *Func) {
 				// tagged with call cost. Net effect is that loop entry is favored.
 				b0 := b.Succs[0].b.ID
 				b1 := b.Succs[1].b.ID
-				certain[b.ID] = min8(certain[b0], certain[b1])
+				certain[b.ID] = min(certain[b0], certain[b1])
 
 				l := b2l[b.ID]
 				l0 := b2l[b0]
@@ -221,7 +209,7 @@ func likelyadjust(f *Func) {
 			for _, v := range b.Values {
 				if opcodeTable[v.Op].call {
 					local[b.ID] = blCALL
-					certain[b.ID] = max8(blCALL, certain[b.Succs[0].b.ID])
+					certain[b.ID] = max(blCALL, certain[b.Succs[0].b.ID])
 					break
 				}
 			}
@@ -277,7 +265,8 @@ func loopnestfor(f *Func) *loopnest {
 	sdom := f.Sdom()
 	b2l := make([]*loop, f.NumBlocks())
 	loops := make([]*loop, 0)
-	visited := make([]bool, f.NumBlocks())
+	visited := f.Cache.allocBoolSlice(f.NumBlocks())
+	defer f.Cache.freeBoolSlice(visited)
 	sawIrred := false
 
 	if f.pass.debug > 2 {
@@ -369,7 +358,8 @@ func loopnestfor(f *Func) *loopnest {
 	ln := &loopnest{f: f, b2l: b2l, po: po, sdom: sdom, loops: loops, hasIrreducible: sawIrred}
 
 	// Calculate containsUnavoidableCall for regalloc
-	dominatedByCall := make([]bool, f.NumBlocks())
+	dominatedByCall := f.Cache.allocBoolSlice(f.NumBlocks())
+	defer f.Cache.freeBoolSlice(dominatedByCall)
 	for _, b := range po {
 		if checkContainsCall(b) {
 			dominatedByCall[b.ID] = true

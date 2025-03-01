@@ -24,11 +24,12 @@ const (
 	ver12
 	ver116
 	ver118
+	ver120
 )
 
 // A LineTable is a data structure mapping program counters to line numbers.
 //
-// In Go 1.1 and earlier, each function (represented by a Func) had its own LineTable,
+// In Go 1.1 and earlier, each function (represented by a [Func]) had its own LineTable,
 // and the line number corresponded to a numbering of all source lines in the
 // program, across all files. That absolute line number would then have to be
 // converted separately to a file name and line number within the file.
@@ -38,7 +39,7 @@ const (
 // numbers, just line numbers within specific files.
 //
 // For the most part, LineTable's methods should be treated as an internal
-// detail of the package; callers should use the methods on Table instead.
+// detail of the package; callers should use the methods on [Table] instead.
 type LineTable struct {
 	Data []byte
 	PC   uint64
@@ -147,7 +148,11 @@ func (t *LineTable) LineToPC(line int, maxpc uint64) uint64 {
 // NewLineTable returns a new PC/line table
 // corresponding to the encoded data.
 // Text must be the start address of the
-// corresponding text segment.
+// corresponding text segment, with the exact
+// value stored in the 'runtime.text' symbol.
+// This value may differ from the start
+// address of the text segment if
+// binary was built with cgo enabled.
 func NewLineTable(data []byte, text uint64) *LineTable {
 	return &LineTable{Data: data, PC: text, Line: 0, funcNames: make(map[uint32]string), strings: make(map[uint32]string)}
 }
@@ -173,6 +178,7 @@ const (
 	go12magic  = 0xfffffffb
 	go116magic = 0xfffffffa
 	go118magic = 0xfffffff0
+	go120magic = 0xfffffff1
 )
 
 // uintptr returns the pointer-sized value encoded at b.
@@ -229,6 +235,10 @@ func (t *LineTable) parsePclnTab() {
 		t.binary, possibleVersion = binary.LittleEndian, ver118
 	case beMagic == go118magic:
 		t.binary, possibleVersion = binary.BigEndian, ver118
+	case leMagic == go120magic:
+		t.binary, possibleVersion = binary.LittleEndian, ver120
+	case beMagic == go120magic:
+		t.binary, possibleVersion = binary.BigEndian, ver120
 	default:
 		return
 	}
@@ -246,7 +256,7 @@ func (t *LineTable) parsePclnTab() {
 	}
 
 	switch possibleVersion {
-	case ver118:
+	case ver118, ver120:
 		t.nfunctab = uint32(offset(0))
 		t.nfiletab = uint32(offset(1))
 		t.textStart = t.PC // use the start PC instead of reading from the table, which may be unrelocated
@@ -306,11 +316,12 @@ func (t *LineTable) go12Funcs() []Func {
 		f.LineTable = t
 		f.FrameSize = int(info.deferreturn())
 		syms[i] = Sym{
-			Value:  f.Entry,
-			Type:   'T',
-			Name:   t.funcName(info.nameoff()),
-			GoType: 0,
-			Func:   f,
+			Value:     f.Entry,
+			Type:      'T',
+			Name:      t.funcName(info.nameOff()),
+			GoType:    0,
+			Func:      f,
+			goVersion: t.version,
 		}
 		f.Sym = &syms[i]
 	}
@@ -449,7 +460,7 @@ func (f *funcData) entryPC() uint64 {
 	return f.t.uintptr(f.data)
 }
 
-func (f funcData) nameoff() uint32     { return f.field(1) }
+func (f funcData) nameOff() uint32     { return f.field(1) }
 func (f funcData) deferreturn() uint32 { return f.field(3) }
 func (f funcData) pcfile() uint32      { return f.field(5) }
 func (f funcData) pcln() uint32        { return f.field(6) }
@@ -527,7 +538,7 @@ func (t *LineTable) findFileLine(entry uint64, filetab, linetab uint32, filenum,
 	fileStartPC := filePC
 	for t.step(&fp, &filePC, &fileVal, filePC == entry) {
 		fileIndex := fileVal
-		if t.version == ver116 || t.version == ver118 {
+		if t.version == ver116 || t.version == ver118 || t.version == ver120 {
 			fileIndex = int32(t.binary.Uint32(cutab[fileVal*4:]))
 		}
 		if fileIndex == filenum && fileStartPC < filePC {
@@ -626,7 +637,7 @@ func (t *LineTable) go12LineToPC(file string, line int) (pc uint64) {
 		entry := f.entryPC()
 		filetab := f.pcfile()
 		linetab := f.pcln()
-		if t.version == ver116 || t.version == ver118 {
+		if t.version == ver116 || t.version == ver118 || t.version == ver120 {
 			if f.cuOffset() == ^uint32(0) {
 				// skip functions without compilation unit (not real function, or linker generated)
 				continue

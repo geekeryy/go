@@ -5,8 +5,12 @@
 package escape
 
 import (
+	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/typecheck"
+	"cmd/compile/internal/types"
+	"go/constant"
+	"go/token"
 )
 
 func isSliceSelfAssign(dst, src ir.Node) bool {
@@ -150,7 +154,7 @@ func mayAffectMemory(n ir.Node) bool {
 		n := n.(*ir.ConvExpr)
 		return mayAffectMemory(n.X)
 
-	case ir.OLEN, ir.OCAP, ir.ONOT, ir.OBITNOT, ir.OPLUS, ir.ONEG, ir.OALIGNOF, ir.OOFFSETOF, ir.OSIZEOF:
+	case ir.OLEN, ir.OCAP, ir.ONOT, ir.OBITNOT, ir.OPLUS, ir.ONEG:
 		n := n.(*ir.UnaryExpr)
 		return mayAffectMemory(n.X)
 
@@ -185,9 +189,15 @@ func HeapAllocReason(n ir.Node) string {
 	if n.Type().Size() > ir.MaxStackVarSize {
 		return "too large for stack"
 	}
+	if n.Type().Alignment() > int64(types.PtrSize) {
+		return "too aligned for stack"
+	}
 
 	if (n.Op() == ir.ONEW || n.Op() == ir.OPTRLIT) && n.Type().Elem().Size() > ir.MaxImplicitStackVarSize {
 		return "too large for stack"
+	}
+	if (n.Op() == ir.ONEW || n.Op() == ir.OPTRLIT) && n.Type().Elem().Alignment() > int64(types.PtrSize) {
+		return "too aligned for stack"
 	}
 
 	if n.Op() == ir.OCLOSURE && typecheck.ClosureType(n.(*ir.ClosureExpr)).Size() > ir.MaxImplicitStackVarSize {
@@ -199,14 +209,28 @@ func HeapAllocReason(n ir.Node) string {
 
 	if n.Op() == ir.OMAKESLICE {
 		n := n.(*ir.MakeExpr)
-		r := n.Cap
-		if r == nil {
-			r = n.Len
+
+		r := &n.Cap
+		if n.Cap == nil {
+			r = &n.Len
 		}
-		if !ir.IsSmallIntConst(r) {
+
+		// Try to determine static values of make() calls, to avoid allocating them on the heap.
+		// We are doing this in escape analysis, so that it happens after inlining and devirtualization.
+		if s := ir.StaticValue(*r); s.Op() == ir.OLITERAL {
+			lit, ok := s.(*ir.BasicLit)
+			if !ok || lit.Val().Kind() != constant.Int {
+				base.Fatalf("unexpected BasicLit Kind")
+			}
+			if constant.Compare(lit.Val(), token.GEQ, constant.MakeInt64(0)) {
+				*r = lit
+			}
+		}
+
+		if !ir.IsSmallIntConst(*r) {
 			return "non-constant size"
 		}
-		if t := n.Type(); t.Elem().Size() != 0 && ir.Int64Val(r) > ir.MaxImplicitStackVarSize/t.Elem().Size() {
+		if t := n.Type(); t.Elem().Size() != 0 && ir.Int64Val(*r) > ir.MaxImplicitStackVarSize/t.Elem().Size() {
 			return "too large for stack"
 		}
 	}

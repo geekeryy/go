@@ -6,7 +6,7 @@ package debug
 
 import (
 	"runtime"
-	"sort"
+	"slices"
 	"time"
 )
 
@@ -63,15 +63,13 @@ func ReadGCStats(stats *GCStats) {
 
 	if len(stats.PauseQuantiles) > 0 {
 		if n == 0 {
-			for i := range stats.PauseQuantiles {
-				stats.PauseQuantiles[i] = 0
-			}
+			clear(stats.PauseQuantiles)
 		} else {
 			// There's room for a second copy of the data in stats.Pause.
 			// See the allocation at the top of the function.
 			sorted := stats.Pause[n : n+n]
 			copy(sorted, stats.Pause)
-			sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+			slices.Sort(sorted)
 			nq := len(stats.PauseQuantiles) - 1
 			for i := 0; i < nq; i++ {
 				stats.PauseQuantiles[i] = sorted[len(sorted)*i/nq]
@@ -188,7 +186,6 @@ func SetTraceback(level string)
 // aggressively. This limit will be respected even if GOGC=off (or,
 // if SetGCPercent(-1) is executed).
 //
-//
 // The input limit is provided as bytes, and includes all memory
 // mapped, managed, and not released by the Go runtime. Notably, it
 // does not account for space used by the Go binary and memory
@@ -202,11 +199,11 @@ func SetTraceback(level string)
 // More specifically, the following expression accurately reflects
 // the value the runtime attempts to maintain as the limit:
 //
-//     runtime.MemStats.Sys - runtime.MemStats.HeapReleased
+//	runtime.MemStats.Sys - runtime.MemStats.HeapReleased
 //
 // or in terms of the runtime/metrics package:
 //
-//     /memory/classes/total:bytes - /memory/classes/heap/released:bytes
+//	/memory/classes/total:bytes - /memory/classes/heap/released:bytes
 //
 // A zero limit or a limit that's lower than the amount of memory
 // used by the Go runtime may cause the garbage collector to run
@@ -215,7 +212,7 @@ func SetTraceback(level string)
 //
 // The memory limit is always respected by the Go runtime, so to
 // effectively disable this behavior, set the limit very high.
-// math.MaxInt64 is the canonical value for disabling the limit,
+// [math.MaxInt64] is the canonical value for disabling the limit,
 // but values much greater than the available memory on the underlying
 // system work just as well.
 //

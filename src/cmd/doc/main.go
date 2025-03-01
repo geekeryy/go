@@ -44,25 +44,38 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"go/build"
 	"go/token"
 	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"cmd/internal/browser"
+	"cmd/internal/quoted"
+	"cmd/internal/telemetry/counter"
 )
 
 var (
-	unexported bool // -u flag
-	matchCase  bool // -c flag
-	showAll    bool // -all flag
-	showCmd    bool // -cmd flag
-	showSrc    bool // -src flag
-	short      bool // -short flag
+	unexported bool   // -u flag
+	matchCase  bool   // -c flag
+	chdir      string // -C flag
+	showAll    bool   // -all flag
+	showCmd    bool   // -cmd flag
+	showSrc    bool   // -src flag
+	short      bool   // -short flag
+	serveHTTP  bool   // -http flag
 )
 
 // usage is a replacement usage function for the flags package.
@@ -84,6 +97,7 @@ func usage() {
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("doc: ")
+	counter.Open()
 	dirsInit()
 	err := do(os.Stdout, flag.CommandLine, os.Args[1:])
 	if err != nil {
@@ -96,13 +110,22 @@ func do(writer io.Writer, flagSet *flag.FlagSet, args []string) (err error) {
 	flagSet.Usage = usage
 	unexported = false
 	matchCase = false
+	flagSet.StringVar(&chdir, "C", "", "change to `dir` before running command")
 	flagSet.BoolVar(&unexported, "u", false, "show unexported symbols as well as exported")
 	flagSet.BoolVar(&matchCase, "c", false, "symbol matching honors case (paths not affected)")
 	flagSet.BoolVar(&showAll, "all", false, "show all documentation for package")
 	flagSet.BoolVar(&showCmd, "cmd", false, "show symbols with package docs even if package is a command")
 	flagSet.BoolVar(&showSrc, "src", false, "show source code for symbol")
 	flagSet.BoolVar(&short, "short", false, "one-line representation for each symbol")
+	flagSet.BoolVar(&serveHTTP, "http", false, "serve HTML docs over HTTP")
 	flagSet.Parse(args)
+	counter.Inc("doc/invocations")
+	counter.CountFlags("doc/flag:", *flag.CommandLine)
+	if chdir != "" {
+		if err := os.Chdir(chdir); err != nil {
+			return err
+		}
+	}
 	var paths []string
 	var symbol, method string
 	// Loop until something is printed.
@@ -140,12 +163,9 @@ func do(writer io.Writer, flagSet *flag.FlagSet, args []string) (err error) {
 			panic(e)
 		}()
 
-		// We have a package.
-		if showAll && symbol == "" {
-			pkg.allDoc()
-			return
+		if serveHTTP {
+			return doPkgsite(pkg, symbol, method)
 		}
-
 		switch {
 		case symbol == "":
 			pkg.packageDoc() // The package exists, so we got some output.
@@ -154,15 +174,97 @@ func do(writer io.Writer, flagSet *flag.FlagSet, args []string) (err error) {
 			if pkg.symbolDoc(symbol) {
 				return
 			}
-		default:
-			if pkg.methodDoc(symbol, method) {
-				return
-			}
-			if pkg.fieldDoc(symbol, method) {
-				return
-			}
+		case pkg.printMethodDoc(symbol, method):
+			return
+		case pkg.printFieldDoc(symbol, method):
+			return
 		}
 	}
+}
+
+func doPkgsite(pkg *Package, symbol, method string) error {
+	ctx := context.Background()
+
+	cmdline := "go run golang.org/x/pkgsite/cmd/pkgsite@latest -gorepo=" + buildCtx.GOROOT
+	words, err := quoted.Split(cmdline)
+	port, err := pickUnusedPort()
+	if err != nil {
+		return fmt.Errorf("failed to find port for documentation server: %v", err)
+	}
+	addr := fmt.Sprintf("localhost:%d", port)
+	words = append(words, fmt.Sprintf("-http=%s", addr))
+	cmd := exec.CommandContext(context.Background(), words[0], words[1:]...)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	// Turn off the default signal handler for SIGINT (and SIGQUIT on Unix)
+	// and instead wait for the child process to handle the signal and
+	// exit before exiting ourselves.
+	signal.Ignore(signalsToIgnore...)
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("starting pkgsite: %v", err)
+	}
+
+	// Wait for pkgsite to became available.
+	if !waitAvailable(ctx, addr) {
+		cmd.Cancel()
+		cmd.Wait()
+		return errors.New("could not connect to local documentation server")
+	}
+
+	// Open web browser.
+	path := path.Join("http://"+addr, pkg.build.ImportPath)
+	object := symbol
+	if symbol != "" && method != "" {
+		object = symbol + "." + method
+	}
+	if object != "" {
+		path = path + "#" + object
+	}
+	if ok := browser.Open(path); !ok {
+		cmd.Cancel()
+		cmd.Wait()
+		return errors.New("failed to open browser")
+	}
+
+	// Wait for child to terminate. We expect the child process to receive signals from
+	// this terminal and terminate in a timely manner, so this process will terminate
+	// soon after.
+	return cmd.Wait()
+}
+
+// pickUnusedPort finds an unused port by trying to listen on port 0
+// and letting the OS pick a port, then closing that connection and
+// returning that port number.
+// This is inherently racy.
+func pickUnusedPort() (int, error) {
+	l, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		return 0, err
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	if err := l.Close(); err != nil {
+		return 0, err
+	}
+	return port, nil
+}
+
+func waitAvailable(ctx context.Context, addr string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	for ctx.Err() == nil {
+		req, err := http.NewRequestWithContext(ctx, "HEAD", "http://"+addr, nil)
+		if err != nil {
+			log.Println(err)
+			return false
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			return true
+		}
+	}
+	return false
 }
 
 // failMessage creates a nicely formatted error message when there is no result to show.

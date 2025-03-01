@@ -10,15 +10,17 @@ import (
 	"os"
 )
 
+const supportsSendfile = true
+
 // sendFile copies the contents of r to c using the sendfile
 // system call to minimize copies.
 //
-// if handled == true, sendFile returns the number of bytes copied and any
-// non-EOF error.
+// if handled == true, sendFile returns the number (potentially zero) of bytes
+// copied and any non-EOF error.
 //
 // if handled == false, sendFile performed no work.
 func sendFile(c *netFD, r io.Reader) (written int64, err error, handled bool) {
-	var remain int64 = 1 << 62 // by default, copy until EOF
+	var remain int64 = 0 // 0 indicates sending until EOF
 
 	lr, ok := r.(*io.LimitedReader)
 	if ok {
@@ -39,7 +41,7 @@ func sendFile(c *netFD, r io.Reader) (written int64, err error, handled bool) {
 
 	var werr error
 	err = sc.Read(func(fd uintptr) bool {
-		written, werr = poll.SendFile(&c.pfd, int(fd), remain)
+		written, werr, handled = poll.SendFile(&c.pfd, int(fd), remain)
 		return true
 	})
 	if err == nil {
@@ -49,5 +51,5 @@ func sendFile(c *netFD, r io.Reader) (written int64, err error, handled bool) {
 	if lr != nil {
 		lr.N = remain - written
 	}
-	return written, wrapSyscallError("sendfile", err), written > 0
+	return written, wrapSyscallError("sendfile", err), handled
 }

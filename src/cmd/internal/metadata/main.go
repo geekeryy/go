@@ -5,6 +5,12 @@
 // Metadata prints basic system metadata to include in test logs. This is
 // separate from cmd/dist so it does not need to build with the bootstrap
 // toolchain.
+
+// This program is only used by cmd/dist. Add an "ignore" build tag so it
+// is not installed. cmd/dist does "go run main.go" directly.
+
+//go:build ignore
+
 package main
 
 import (
@@ -16,7 +22,7 @@ import (
 
 func main() {
 	fmt.Printf("# GOARCH: %s\n", runtime.GOARCH)
-	fmt.Printf("# CPU: %s\n", sysinfo.CPU.Name())
+	fmt.Printf("# CPU: %s\n", sysinfo.CPUName())
 
 	fmt.Printf("# GOOS: %s\n", runtime.GOOS)
 	ver, err := osinfo.Version()

@@ -11,6 +11,7 @@ import (
 	"cmd/compile/internal/types2"
 	"fmt"
 	"go/token"
+	"internal/pkgbits"
 	"sync"
 )
 
@@ -129,8 +130,7 @@ var predeclared = []types2.Type{
 	// comparable
 	types2.Universe.Lookup("comparable").Type(),
 
-	// any
-	types2.Universe.Lookup("any").Type(),
+	// "any" has special handling: see usage of predeclared.
 }
 
 type anyType struct{}
@@ -138,12 +138,14 @@ type anyType struct{}
 func (t anyType) Underlying() types2.Type { return t }
 func (t anyType) String() string          { return "any" }
 
+// See cmd/compile/internal/noder.derivedInfo.
 type derivedInfo struct {
-	idx    int
+	idx    pkgbits.Index
 	needed bool
 }
 
+// See cmd/compile/internal/noder.typeInfo.
 type typeInfo struct {
-	idx     int
+	idx     pkgbits.Index
 	derived bool
 }

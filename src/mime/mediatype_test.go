@@ -5,7 +5,7 @@
 package mime
 
 import (
-	"reflect"
+	"maps"
 	"strings"
 	"testing"
 )
@@ -407,8 +407,11 @@ func TestParseMediaType(t *testing.T) {
 			`message/external-body`,
 			m("access-type", "URL", "url", "ftp://cs.utk.edu/pub/moore/bulk-mailer/bulk-mailer.tar"),
 		},
-	}
 
+		// Issue #48866: duplicate parameters containing equal values should be allowed
+		{`text; charset=utf-8; charset=utf-8; format=fixed`, "text", m("charset", "utf-8", "format", "fixed")},
+		{`text; charset=utf-8; format=flowed; charset=utf-8`, "text", m("charset", "utf-8", "format", "flowed")},
+	}
 	for _, test := range tests {
 		mt, params, err := ParseMediaType(test.in)
 		if err != nil {
@@ -426,7 +429,7 @@ func TestParseMediaType(t *testing.T) {
 		if len(params) == 0 && len(test.p) == 0 {
 			continue
 		}
-		if !reflect.DeepEqual(params, test.p) {
+		if !maps.Equal(params, test.p) {
 			t.Errorf("for input %#q, wrong params.\n"+
 				"expected: %#v\n"+
 				"     got: %#v",

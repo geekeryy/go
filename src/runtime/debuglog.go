@@ -12,11 +12,23 @@
 //
 // This facility can be enabled by passing -tags debuglog when
 // building. Without this tag, dlog calls compile to nothing.
+//
+// Implementation notes
+//
+// There are two implementations of the dlog interface: dloggerImpl and
+// dloggerFake. dloggerFake is a no-op implementation. dlogger is type-aliased
+// to one or the other depending on the debuglog build tag. However, both types
+// always exist and are always built. This helps ensure we compile as much of
+// the implementation as possible in the default build configuration, while also
+// enabling us to achieve good test coverage of the real debuglog implementation
+// even when the debuglog build tag is not set.
 
 package runtime
 
 import (
-	"runtime/internal/atomic"
+	"internal/abi"
+	"internal/runtime/atomic"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -46,11 +58,20 @@ const debugLogStringLimit = debugLogBytes / 8
 //
 //go:nosplit
 //go:nowritebarrierrec
-func dlog() *dlogger {
-	if !dlogEnabled {
-		return nil
-	}
+func dlog() dlogger {
+	// dlog1 is defined to either dlogImpl or dlogFake.
+	return dlog1()
+}
 
+//go:nosplit
+//go:nowritebarrierrec
+func dlogFake() dloggerFake {
+	return dloggerFake{}
+}
+
+//go:nosplit
+//go:nowritebarrierrec
+func dlogImpl() *dloggerImpl {
 	// Get the time.
 	tick, nano := uint64(cputicks()), uint64(nanotime())
 
@@ -61,9 +82,9 @@ func dlog() *dlogger {
 	// global pool.
 	if l == nil {
 		allp := (*uintptr)(unsafe.Pointer(&allDloggers))
-		all := (*dlogger)(unsafe.Pointer(atomic.Loaduintptr(allp)))
+		all := (*dloggerImpl)(unsafe.Pointer(atomic.Loaduintptr(allp)))
 		for l1 := all; l1 != nil; l1 = l1.allLink {
-			if atomic.Load(&l1.owned) == 0 && atomic.Cas(&l1.owned, 0, 1) {
+			if l1.owned.Load() == 0 && l1.owned.CompareAndSwap(0, 1) {
 				l = l1
 				break
 			}
@@ -74,18 +95,18 @@ func dlog() *dlogger {
 	if l == nil {
 		// Use sysAllocOS instead of sysAlloc because we want to interfere
 		// with the runtime as little as possible, and sysAlloc updates accounting.
-		l = (*dlogger)(sysAllocOS(unsafe.Sizeof(dlogger{})))
+		l = (*dloggerImpl)(sysAllocOS(unsafe.Sizeof(dloggerImpl{})))
 		if l == nil {
 			throw("failed to allocate debug log")
 		}
 		l.w.r.data = &l.w.data
-		l.owned = 1
+		l.owned.Store(1)
 
 		// Prepend to allDloggers list.
 		headp := (*uintptr)(unsafe.Pointer(&allDloggers))
 		for {
 			head := atomic.Loaduintptr(headp)
-			l.allLink = (*dlogger)(unsafe.Pointer(head))
+			l.allLink = (*dloggerImpl)(unsafe.Pointer(head))
 			if atomic.Casuintptr(headp, head, uintptr(unsafe.Pointer(l))) {
 				break
 			}
@@ -117,34 +138,35 @@ func dlog() *dlogger {
 	return l
 }
 
-// A dlogger writes to the debug log.
+// A dloggerImpl writes to the debug log.
 //
-// To obtain a dlogger, call dlog(). When done with the dlogger, call
+// To obtain a dloggerImpl, call dlog(). When done with the dloggerImpl, call
 // end().
-//
-//go:notinheap
-type dlogger struct {
+type dloggerImpl struct {
+	_ sys.NotInHeap
 	w debugLogWriter
 
 	// allLink is the next dlogger in the allDloggers list.
-	allLink *dlogger
+	allLink *dloggerImpl
 
 	// owned indicates that this dlogger is owned by an M. This is
 	// accessed atomically.
-	owned uint32
+	owned atomic.Uint32
 }
 
 // allDloggers is a list of all dloggers, linked through
 // dlogger.allLink. This is accessed atomically. This is prepend only,
 // so it doesn't need to protect against ABA races.
-var allDloggers *dlogger
+var allDloggers *dloggerImpl
+
+// A dloggerFake is a no-op implementation of dlogger.
+type dloggerFake struct{}
 
 //go:nosplit
-func (l *dlogger) end() {
-	if !dlogEnabled {
-		return
-	}
+func (l dloggerFake) end() {}
 
+//go:nosplit
+func (l *dloggerImpl) end() {
 	// Fill in framing header.
 	size := l.w.write - l.w.r.end
 	if !l.w.writeFrameAt(l.w.r.end, size) {
@@ -160,7 +182,7 @@ func (l *dlogger) end() {
 	}
 
 	// Return the logger to the global pool.
-	atomic.Store(&l.owned, 0)
+	l.owned.Store(0)
 }
 
 const (
@@ -180,10 +202,10 @@ const (
 )
 
 //go:nosplit
-func (l *dlogger) b(x bool) *dlogger {
-	if !dlogEnabled {
-		return l
-	}
+func (l dloggerFake) b(x bool) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) b(x bool) *dloggerImpl {
 	if x {
 		l.w.byte(debugLogBoolTrue)
 	} else {
@@ -193,92 +215,119 @@ func (l *dlogger) b(x bool) *dlogger {
 }
 
 //go:nosplit
-func (l *dlogger) i(x int) *dlogger {
+func (l dloggerFake) i(x int) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) i(x int) *dloggerImpl {
 	return l.i64(int64(x))
 }
 
 //go:nosplit
-func (l *dlogger) i8(x int8) *dlogger {
+func (l dloggerFake) i8(x int8) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) i8(x int8) *dloggerImpl {
 	return l.i64(int64(x))
 }
 
 //go:nosplit
-func (l *dlogger) i16(x int16) *dlogger {
+func (l dloggerFake) i16(x int16) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) i16(x int16) *dloggerImpl {
 	return l.i64(int64(x))
 }
 
 //go:nosplit
-func (l *dlogger) i32(x int32) *dlogger {
+func (l dloggerFake) i32(x int32) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) i32(x int32) *dloggerImpl {
 	return l.i64(int64(x))
 }
 
 //go:nosplit
-func (l *dlogger) i64(x int64) *dlogger {
-	if !dlogEnabled {
-		return l
-	}
+func (l dloggerFake) i64(x int64) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) i64(x int64) *dloggerImpl {
 	l.w.byte(debugLogInt)
 	l.w.varint(x)
 	return l
 }
 
 //go:nosplit
-func (l *dlogger) u(x uint) *dlogger {
+func (l dloggerFake) u(x uint) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) u(x uint) *dloggerImpl {
 	return l.u64(uint64(x))
 }
 
 //go:nosplit
-func (l *dlogger) uptr(x uintptr) *dlogger {
+func (l dloggerFake) uptr(x uintptr) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) uptr(x uintptr) *dloggerImpl {
 	return l.u64(uint64(x))
 }
 
 //go:nosplit
-func (l *dlogger) u8(x uint8) *dlogger {
+func (l dloggerFake) u8(x uint8) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) u8(x uint8) *dloggerImpl {
 	return l.u64(uint64(x))
 }
 
 //go:nosplit
-func (l *dlogger) u16(x uint16) *dlogger {
+func (l dloggerFake) u16(x uint16) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) u16(x uint16) *dloggerImpl {
 	return l.u64(uint64(x))
 }
 
 //go:nosplit
-func (l *dlogger) u32(x uint32) *dlogger {
+func (l dloggerFake) u32(x uint32) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) u32(x uint32) *dloggerImpl {
 	return l.u64(uint64(x))
 }
 
 //go:nosplit
-func (l *dlogger) u64(x uint64) *dlogger {
-	if !dlogEnabled {
-		return l
-	}
+func (l dloggerFake) u64(x uint64) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) u64(x uint64) *dloggerImpl {
 	l.w.byte(debugLogUint)
 	l.w.uvarint(x)
 	return l
 }
 
 //go:nosplit
-func (l *dlogger) hex(x uint64) *dlogger {
-	if !dlogEnabled {
-		return l
-	}
+func (l dloggerFake) hex(x uint64) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) hex(x uint64) *dloggerImpl {
 	l.w.byte(debugLogHex)
 	l.w.uvarint(x)
 	return l
 }
 
 //go:nosplit
-func (l *dlogger) p(x any) *dlogger {
-	if !dlogEnabled {
-		return l
-	}
+func (l dloggerFake) p(x any) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) p(x any) *dloggerImpl {
 	l.w.byte(debugLogPtr)
 	if x == nil {
 		l.w.uvarint(0)
 	} else {
 		v := efaceOf(&x)
-		switch v._type.kind & kindMask {
-		case kindChan, kindFunc, kindMap, kindPtr, kindUnsafePointer:
+		switch v._type.Kind_ & abi.KindMask {
+		case abi.Chan, abi.Func, abi.Map, abi.Pointer, abi.UnsafePointer:
 			l.w.uvarint(uint64(uintptr(v.data)))
 		default:
 			throw("not a pointer type")
@@ -288,25 +337,27 @@ func (l *dlogger) p(x any) *dlogger {
 }
 
 //go:nosplit
-func (l *dlogger) s(x string) *dlogger {
-	if !dlogEnabled {
-		return l
-	}
-	str := stringStructOf(&x)
+func (l dloggerFake) s(x string) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) s(x string) *dloggerImpl {
+	strData := unsafe.StringData(x)
 	datap := &firstmoduledata
-	if len(x) > 4 && datap.etext <= uintptr(str.str) && uintptr(str.str) < datap.end {
+	if len(x) > 4 && datap.etext <= uintptr(unsafe.Pointer(strData)) && uintptr(unsafe.Pointer(strData)) < datap.end {
 		// String constants are in the rodata section, which
 		// isn't recorded in moduledata. But it has to be
 		// somewhere between etext and end.
 		l.w.byte(debugLogConstString)
-		l.w.uvarint(uint64(str.len))
-		l.w.uvarint(uint64(uintptr(str.str) - datap.etext))
+		l.w.uvarint(uint64(len(x)))
+		l.w.uvarint(uint64(uintptr(unsafe.Pointer(strData)) - datap.etext))
 	} else {
 		l.w.byte(debugLogString)
+		// We can't use unsafe.Slice as it may panic, which isn't safe
+		// in this (potentially) nowritebarrier context.
 		var b []byte
 		bb := (*slice)(unsafe.Pointer(&b))
-		bb.array = str.str
-		bb.len, bb.cap = str.len, str.len
+		bb.array = unsafe.Pointer(strData)
+		bb.len, bb.cap = len(x), len(x)
 		if len(b) > debugLogStringLimit {
 			b = b[:debugLogStringLimit]
 		}
@@ -321,20 +372,20 @@ func (l *dlogger) s(x string) *dlogger {
 }
 
 //go:nosplit
-func (l *dlogger) pc(x uintptr) *dlogger {
-	if !dlogEnabled {
-		return l
-	}
+func (l dloggerFake) pc(x uintptr) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) pc(x uintptr) *dloggerImpl {
 	l.w.byte(debugLogPC)
 	l.w.uvarint(uint64(x))
 	return l
 }
 
 //go:nosplit
-func (l *dlogger) traceback(x []uintptr) *dlogger {
-	if !dlogEnabled {
-		return l
-	}
+func (l dloggerFake) traceback(x []uintptr) dloggerFake { return l }
+
+//go:nosplit
+func (l *dloggerImpl) traceback(x []uintptr) *dloggerImpl {
 	l.w.byte(debugLogTraceback)
 	l.w.uvarint(uint64(len(x)))
 	for _, pc := range x {
@@ -356,9 +407,8 @@ func (l *dlogger) traceback(x []uintptr) *dlogger {
 // overwrite old records. Hence, it maintains a reader that consumes
 // the log as it gets overwritten. That reader state is where an
 // actual log reader would start.
-//
-//go:notinheap
 type debugLogWriter struct {
+	_     sys.NotInHeap
 	write uint64
 	data  debugLogBuf
 
@@ -376,8 +426,10 @@ type debugLogWriter struct {
 	buf [10]byte
 }
 
-//go:notinheap
-type debugLogBuf [debugLogBytes]byte
+type debugLogBuf struct {
+	_ sys.NotInHeap
+	b [debugLogBytes]byte
+}
 
 const (
 	// debugLogHeaderSize is the number of bytes in the framing
@@ -390,7 +442,7 @@ const (
 
 //go:nosplit
 func (l *debugLogWriter) ensure(n uint64) {
-	for l.write+n >= l.r.begin+uint64(len(l.data)) {
+	for l.write+n >= l.r.begin+uint64(len(l.data.b)) {
 		// Consume record at begin.
 		if l.r.skip() == ^uint64(0) {
 			// Wrapped around within a record.
@@ -406,8 +458,8 @@ func (l *debugLogWriter) ensure(n uint64) {
 
 //go:nosplit
 func (l *debugLogWriter) writeFrameAt(pos, size uint64) bool {
-	l.data[pos%uint64(len(l.data))] = uint8(size)
-	l.data[(pos+1)%uint64(len(l.data))] = uint8(size >> 8)
+	l.data.b[pos%uint64(len(l.data.b))] = uint8(size)
+	l.data.b[(pos+1)%uint64(len(l.data.b))] = uint8(size >> 8)
 	return size <= 0xFFFF
 }
 
@@ -441,7 +493,7 @@ func (l *debugLogWriter) byte(x byte) {
 	l.ensure(1)
 	pos := l.write
 	l.write++
-	l.data[pos%uint64(len(l.data))] = x
+	l.data.b[pos%uint64(len(l.data.b))] = x
 }
 
 //go:nosplit
@@ -450,7 +502,7 @@ func (l *debugLogWriter) bytes(x []byte) {
 	pos := l.write
 	l.write += uint64(len(x))
 	for len(x) > 0 {
-		n := copy(l.data[pos%uint64(len(l.data)):], x)
+		n := copy(l.data.b[pos%uint64(len(l.data.b)):], x)
 		pos += uint64(n)
 		x = x[n:]
 	}
@@ -513,15 +565,15 @@ func (r *debugLogReader) skip() uint64 {
 
 //go:nosplit
 func (r *debugLogReader) readUint16LEAt(pos uint64) uint16 {
-	return uint16(r.data[pos%uint64(len(r.data))]) |
-		uint16(r.data[(pos+1)%uint64(len(r.data))])<<8
+	return uint16(r.data.b[pos%uint64(len(r.data.b))]) |
+		uint16(r.data.b[(pos+1)%uint64(len(r.data.b))])<<8
 }
 
 //go:nosplit
 func (r *debugLogReader) readUint64LEAt(pos uint64) uint64 {
 	var b [8]byte
 	for i := range b {
-		b[i] = r.data[pos%uint64(len(r.data))]
+		b[i] = r.data.b[pos%uint64(len(r.data.b))]
 		pos++
 	}
 	return uint64(b[0]) | uint64(b[1])<<8 |
@@ -557,7 +609,7 @@ func (r *debugLogReader) peek() (tick uint64) {
 	pos := r.begin + debugLogHeaderSize
 	var u uint64
 	for i := uint(0); ; i += 7 {
-		b := r.data[pos%uint64(len(r.data))]
+		b := r.data.b[pos%uint64(len(r.data.b))]
 		pos++
 		u |= uint64(b&^0x80) << i
 		if b&0x80 == 0 {
@@ -588,7 +640,7 @@ func (r *debugLogReader) header() (end, tick, nano uint64, p int) {
 func (r *debugLogReader) uvarint() uint64 {
 	var u uint64
 	for i := uint(0); ; i += 7 {
-		b := r.data[r.begin%uint64(len(r.data))]
+		b := r.data.b[r.begin%uint64(len(r.data.b))]
 		r.begin++
 		u |= uint64(b&^0x80) << i
 		if b&0x80 == 0 {
@@ -610,7 +662,7 @@ func (r *debugLogReader) varint() int64 {
 }
 
 func (r *debugLogReader) printVal() bool {
-	typ := r.data[r.begin%uint64(len(r.data))]
+	typ := r.data.b[r.begin%uint64(len(r.data.b))]
 	r.begin++
 
 	switch typ {
@@ -644,7 +696,7 @@ func (r *debugLogReader) printVal() bool {
 			break
 		}
 		for sl > 0 {
-			b := r.data[r.begin%uint64(len(r.data)):]
+			b := r.data.b[r.begin%uint64(len(r.data.b)):]
 			if uint64(len(b)) > sl {
 				b = b[:sl]
 			}
@@ -656,6 +708,8 @@ func (r *debugLogReader) printVal() bool {
 	case debugLogConstString:
 		len, ptr := int(r.uvarint()), uintptr(r.uvarint())
 		ptr += firstmoduledata.etext
+		// We can't use unsafe.String as it may panic, which isn't safe
+		// in this (potentially) nowritebarrier context.
 		str := stringStruct{
 			str: unsafe.Pointer(ptr),
 			len: len,
@@ -686,10 +740,12 @@ func (r *debugLogReader) printVal() bool {
 
 // printDebugLog prints the debug log.
 func printDebugLog() {
-	if !dlogEnabled {
-		return
+	if dlogEnabled {
+		printDebugLogImpl()
 	}
+}
 
+func printDebugLogImpl() {
 	// This function should not panic or throw since it is used in
 	// the fatal panic path and this may deadlock.
 
@@ -697,7 +753,7 @@ func printDebugLog() {
 
 	// Get the list of all debug logs.
 	allp := (*uintptr)(unsafe.Pointer(&allDloggers))
-	all := (*dlogger)(unsafe.Pointer(atomic.Loaduintptr(allp)))
+	all := (*dloggerImpl)(unsafe.Pointer(atomic.Loaduintptr(allp)))
 
 	// Count the logs.
 	n := 0
@@ -777,7 +833,8 @@ func printDebugLog() {
 			// Logged before runtimeInitTime was set.
 			pnano = 0
 		}
-		print(string(itoaDiv(tmpbuf[:], uint64(pnano), 9)))
+		pnanoBytes := itoaDiv(tmpbuf[:], uint64(pnano), 9)
+		print(slicebytetostringtmp((*byte)(noescape(unsafe.Pointer(&pnanoBytes[0]))), len(pnanoBytes)))
 		print(" P ", p, "] ")
 
 		for i := 0; s.begin < s.end; i++ {

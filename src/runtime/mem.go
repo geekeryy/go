@@ -44,6 +44,7 @@ import "unsafe"
 //
 // Don't split the stack as this function may be invoked without a valid G,
 // which prevents us from allocating more stack.
+//
 //go:nosplit
 func sysAlloc(n uintptr, sysStat *sysMemStat) unsafe.Pointer {
 	sysStat.add(int64(n))
@@ -69,7 +70,7 @@ func sysUnused(v unsafe.Pointer, n uintptr) {
 //
 // This operation is idempotent for memory already in the Prepared state, so
 // it is safe to refer, with v and n, to a range of memory that includes both
-// Prepared and Ready memory. However, the caller must provide the exact amout
+// Prepared and Ready memory. However, the caller must provide the exact amount
 // of Prepared memory for accounting purposes.
 func sysUsed(v unsafe.Pointer, n, prepared uintptr) {
 	gcController.mappedReady.Add(int64(prepared))
@@ -83,6 +84,19 @@ func sysHugePage(v unsafe.Pointer, n uintptr) {
 	sysHugePageOS(v, n)
 }
 
+// sysNoHugePage does not transition memory regions, but instead provides a
+// hint to the OS that it would be less efficient to back this memory region
+// with pages of a larger size transparently.
+func sysNoHugePage(v unsafe.Pointer, n uintptr) {
+	sysNoHugePageOS(v, n)
+}
+
+// sysHugePageCollapse attempts to immediately back the provided memory region
+// with huge pages. It is best-effort and may fail silently.
+func sysHugePageCollapse(v unsafe.Pointer, n uintptr) {
+	sysHugePageCollapseOS(v, n)
+}
+
 // sysFree transitions a memory region from any state to None. Therefore, it
 // returns memory unconditionally. It is used if an out-of-memory error has been
 // detected midway through an allocation or to carve out an aligned section of
@@ -94,6 +108,7 @@ func sysHugePage(v unsafe.Pointer, n uintptr) {
 //
 // Don't split the stack as this function may be invoked without a valid G,
 // which prevents us from allocating more stack.
+//
 //go:nosplit
 func sysFree(v unsafe.Pointer, n uintptr, sysStat *sysMemStat) {
 	sysStat.add(-int64(n))

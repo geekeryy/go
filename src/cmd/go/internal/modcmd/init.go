@@ -25,15 +25,13 @@ module path argument is omitted, init will attempt to infer the module path
 using import comments in .go files, vendoring tool configuration files (like
 Gopkg.lock), and the current directory (if in GOPATH).
 
-If a configuration file for a vendoring tool is present, init will attempt to
-import module requirements from it.
-
 See https://golang.org/ref/mod#go-mod-init for more about 'go mod init'.
 `,
 	Run: runInit,
 }
 
 func init() {
+	base.AddChdirFlag(&cmdInit.Flag)
 	base.AddModCommonFlags(&cmdInit.Flag)
 }
 

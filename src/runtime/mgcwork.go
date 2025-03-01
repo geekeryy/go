@@ -6,7 +6,8 @@ package runtime
 
 import (
 	"internal/goarch"
-	"runtime/internal/atomic"
+	"internal/runtime/atomic"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -320,8 +321,8 @@ type workbufhdr struct {
 	nobj int
 }
 
-//go:notinheap
 type workbuf struct {
+	_ sys.NotInHeap
 	workbufhdr
 	// account for the above fields
 	obj [(_WorkbufSize - unsafe.Sizeof(workbufhdr{})) / goarch.PtrSize]uintptr
@@ -420,7 +421,7 @@ func putfull(b *workbuf) {
 }
 
 // trygetfull tries to get a full or partially empty workbuffer.
-// If one is not immediately available return nil
+// If one is not immediately available return nil.
 //
 //go:nowritebarrier
 func trygetfull() *workbuf {

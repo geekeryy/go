@@ -7,8 +7,8 @@ package runtime
 import (
 	"internal/abi"
 	"internal/goarch"
-	"runtime/internal/atomic"
-	"runtime/internal/syscall"
+	"internal/runtime/atomic"
+	"internal/runtime/syscall"
 	"unsafe"
 )
 
@@ -21,16 +21,22 @@ type mOS struct {
 	// profileTimer holds the ID of the POSIX interval timer for profiling CPU
 	// usage on this thread.
 	//
-	// It is valid when the profileTimerValid field is non-zero. A thread
+	// It is valid when the profileTimerValid field is true. A thread
 	// creates and manages its own timer, and these fields are read and written
 	// only by this thread. But because some of the reads on profileTimerValid
-	// are in signal handling code, access to that field uses atomic operations.
+	// are in signal handling code, this field should be atomic type.
 	profileTimer      int32
-	profileTimerValid uint32
+	profileTimerValid atomic.Bool
 
 	// needPerThreadSyscall indicates that a per-thread syscall is required
 	// for doAllThreadsSyscall.
 	needPerThreadSyscall atomic.Uint8
+
+	// This is a pointer to a chunk of memory allocated with a special
+	// mmap invocation in vgetrandomGetState().
+	vgetrandomState uintptr
+
+	waitsema uint32 // semaphore for parking on locks
 }
 
 //go:noescape
@@ -176,12 +182,20 @@ func newosproc(mp *m) {
 	// with signals disabled. It will enable them in minit.
 	var oset sigset
 	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
-	ret := clone(cloneFlags, stk, unsafe.Pointer(mp), unsafe.Pointer(mp.g0), unsafe.Pointer(abi.FuncPCABI0(mstart)))
+	ret := retryOnEAGAIN(func() int32 {
+		r := clone(cloneFlags, stk, unsafe.Pointer(mp), unsafe.Pointer(mp.g0), unsafe.Pointer(abi.FuncPCABI0(mstart)))
+		// clone returns positive TID, negative errno.
+		// We don't care about the TID.
+		if r >= 0 {
+			return 0
+		}
+		return -r
+	})
 	sigprocmask(_SIG_SETMASK, &oset, nil)
 
-	if ret < 0 {
-		print("runtime: failed to create new OS thread (have ", mcount(), " already; errno=", -ret, ")\n")
-		if ret == -_EAGAIN {
+	if ret != 0 {
+		print("runtime: failed to create new OS thread (have ", mcount(), " already; errno=", ret, ")\n")
+		if ret == _EAGAIN {
 			println("runtime: may need to increase max user processes (ulimit -u)")
 		}
 		throw("newosproc")
@@ -194,25 +208,24 @@ func newosproc(mp *m) {
 func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
 	stack := sysAlloc(stacksize, &memstats.stacks_sys)
 	if stack == nil {
-		write(2, unsafe.Pointer(&failallocatestack[0]), int32(len(failallocatestack)))
+		writeErrStr(failallocatestack)
 		exit(1)
 	}
 	ret := clone(cloneFlags, unsafe.Pointer(uintptr(stack)+stacksize), nil, nil, fn)
 	if ret < 0 {
-		write(2, unsafe.Pointer(&failthreadcreate[0]), int32(len(failthreadcreate)))
+		writeErrStr(failthreadcreate)
 		exit(1)
 	}
 }
 
-var failallocatestack = []byte("runtime: failed to allocate stack for the new OS thread\n")
-var failthreadcreate = []byte("runtime: failed to create new OS thread\n")
-
 const (
-	_AT_NULL   = 0  // End of vector
-	_AT_PAGESZ = 6  // System physical page size
-	_AT_HWCAP  = 16 // hardware capability bit vector
-	_AT_RANDOM = 25 // introduced in 2.6.29
-	_AT_HWCAP2 = 26 // hardware capability bit vector 2
+	_AT_NULL     = 0  // End of vector
+	_AT_PAGESZ   = 6  // System physical page size
+	_AT_PLATFORM = 15 // string identifying platform
+	_AT_HWCAP    = 16 // hardware capability bit vector
+	_AT_SECURE   = 23 // secure mode boolean
+	_AT_RANDOM   = 25 // introduced in 2.6.29
+	_AT_HWCAP2   = 26 // hardware capability bit vector 2
 )
 
 var procAuxv = []byte("/proc/self/auxv\x00")
@@ -220,6 +233,8 @@ var procAuxv = []byte("/proc/self/auxv\x00")
 var addrspace_vec [1]byte
 
 func mincore(addr unsafe.Pointer, n uintptr, dst *byte) int32
+
+var auxvreadbuf [128]uintptr
 
 func sysargs(argc int32, argv **byte) {
 	n := argc + 1
@@ -233,8 +248,10 @@ func sysargs(argc int32, argv **byte) {
 	n++
 
 	// now argv+n is auxv
-	auxv := (*[1 << 28]uintptr)(add(unsafe.Pointer(argv), uintptr(n)*goarch.PtrSize))
-	if sysauxv(auxv[:]) != 0 {
+	auxvp := (*[1 << 28]uintptr)(add(unsafe.Pointer(argv), uintptr(n)*goarch.PtrSize))
+
+	if pairs := sysauxv(auxvp[:]); pairs != 0 {
+		auxv = auxvp[: pairs*2 : pairs*2]
 		return
 	}
 	// In some situations we don't get a loader-provided
@@ -264,34 +281,43 @@ func sysargs(argc int32, argv **byte) {
 		munmap(p, size)
 		return
 	}
-	var buf [128]uintptr
-	n = read(fd, noescape(unsafe.Pointer(&buf[0])), int32(unsafe.Sizeof(buf)))
+
+	n = read(fd, noescape(unsafe.Pointer(&auxvreadbuf[0])), int32(unsafe.Sizeof(auxvreadbuf)))
 	closefd(fd)
 	if n < 0 {
 		return
 	}
 	// Make sure buf is terminated, even if we didn't read
 	// the whole file.
-	buf[len(buf)-2] = _AT_NULL
-	sysauxv(buf[:])
+	auxvreadbuf[len(auxvreadbuf)-2] = _AT_NULL
+	pairs := sysauxv(auxvreadbuf[:])
+	auxv = auxvreadbuf[: pairs*2 : pairs*2]
 }
 
-// startupRandomData holds random bytes initialized at startup. These come from
-// the ELF AT_RANDOM auxiliary vector.
-var startupRandomData []byte
+// secureMode holds the value of AT_SECURE passed in the auxiliary vector.
+var secureMode bool
 
-func sysauxv(auxv []uintptr) int {
+func sysauxv(auxv []uintptr) (pairs int) {
+	// Process the auxiliary vector entries provided by the kernel when the
+	// program is executed. See getauxval(3).
 	var i int
 	for ; auxv[i] != _AT_NULL; i += 2 {
 		tag, val := auxv[i], auxv[i+1]
 		switch tag {
 		case _AT_RANDOM:
-			// The kernel provides a pointer to 16-bytes
-			// worth of random data.
-			startupRandomData = (*[16]byte)(unsafe.Pointer(val))[:]
+			// The kernel provides a pointer to 16 bytes of cryptographically
+			// random data. Note that in cgo programs this value may have
+			// already been used by libc at this point, and in particular glibc
+			// and musl use the value as-is for stack and pointer protector
+			// cookies from libc_start_main and/or dl_start. Also, cgo programs
+			// may use the value after we do.
+			startupRand = (*[16]byte)(unsafe.Pointer(val))[:]
 
 		case _AT_PAGESZ:
 			physPageSize = val
+
+		case _AT_SECURE:
+			secureMode = val == 1
 		}
 
 		archauxv(tag, val)
@@ -329,39 +355,19 @@ func getHugePageSize() uintptr {
 func osinit() {
 	ncpu = getproccount()
 	physHugePageSize = getHugePageSize()
-	if iscgo {
-		// #42494 glibc and musl reserve some signals for
-		// internal use and require they not be blocked by
-		// the rest of a normal C runtime. When the go runtime
-		// blocks...unblocks signals, temporarily, the blocked
-		// interval of time is generally very short. As such,
-		// these expectations of *libc code are mostly met by
-		// the combined go+cgo system of threads. However,
-		// when go causes a thread to exit, via a return from
-		// mstart(), the combined runtime can deadlock if
-		// these signals are blocked. Thus, don't block these
-		// signals when exiting threads.
-		// - glibc: SIGCANCEL (32), SIGSETXID (33)
-		// - musl: SIGTIMER (32), SIGCANCEL (33), SIGSYNCCALL (34)
-		sigdelset(&sigsetAllExiting, 32)
-		sigdelset(&sigsetAllExiting, 33)
-		sigdelset(&sigsetAllExiting, 34)
-	}
 	osArchInit()
+	vgetrandomInit()
 }
 
 var urandom_dev = []byte("/dev/urandom\x00")
 
-func getRandomData(r []byte) {
-	if startupRandomData != nil {
-		n := copy(r, startupRandomData)
-		extendRandom(r, n)
-		return
-	}
+func readRandom(r []byte) int {
+	// Note that all supported Linux kernels should provide AT_RANDOM which
+	// populates startupRand, so this fallback should be unreachable.
 	fd := open(&urandom_dev[0], 0 /* O_RDONLY */, 0)
 	n := read(fd, unsafe.Pointer(&r[0]), int32(len(r)))
 	closefd(fd)
-	extendRandom(r, int(n))
+	return int(n)
 }
 
 func goenvs() {
@@ -403,18 +409,23 @@ func minit() {
 //go:nosplit
 func unminit() {
 	unminitSignals()
+	getg().m.procid = 0
 }
 
 // Called from exitm, but not from drop, to undo the effect of thread-owned
 // resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
 func mdestroy(mp *m) {
+	if mp.vgetrandomState != 0 {
+		vgetrandomPutState(mp.vgetrandomState)
+		mp.vgetrandomState = 0
+	}
 }
 
-//#ifdef GOARCH_386
-//#define sa_handler k_sa_handler
-//#endif
+// #ifdef GOARCH_386
+// #define sa_handler k_sa_handler
+// #endif
 
-func sigreturn()
+func sigreturn__sigaction()
 func sigtramp() // Called via C ABI
 func cgoSigtramp()
 
@@ -456,6 +467,12 @@ func osyield_no_g() {
 
 func pipe2(flags int32) (r, w int32, errno int32)
 
+//go:nosplit
+func fcntl(fd, cmd, arg int32) (ret int32, errno int32) {
+	r, _, err := syscall.Syscall6(syscall.SYS_FCNTL, uintptr(fd), uintptr(cmd), uintptr(arg), 0, 0, 0)
+	return int32(r), int32(err)
+}
+
 const (
 	_si_max_size    = 128
 	_sigev_max_size = 64
@@ -471,7 +488,7 @@ func setsig(i uint32, fn uintptr) {
 	// should not be used". x86_64 kernel requires it. Only use it on
 	// x86.
 	if GOARCH == "386" || GOARCH == "amd64" {
-		sa.sa_restorer = abi.FuncPCABI0(sigreturn)
+		sa.sa_restorer = abi.FuncPCABI0(sigreturn__sigaction)
 	}
 	if fn == abi.FuncPCABIInternal(sighandler) { // abi.FuncPCABIInternal(sighandler) matches the callers in signal_unix.go
 		if iscgo {
@@ -504,7 +521,7 @@ func getsig(i uint32) uintptr {
 	return sa.sa_handler
 }
 
-// setSignaltstackSP sets the ss_sp field of a stackt.
+// setSignalstackSP sets the ss_sp field of a stackt.
 //
 //go:nosplit
 func setSignalstackSP(s *stackt, sp uintptr) {
@@ -553,9 +570,6 @@ func signalM(mp *m, sig int) {
 	tgkill(getpid(), int(mp.procid), sig)
 }
 
-// go118UseTimerCreateProfiler enables the per-thread CPU profiler.
-const go118UseTimerCreateProfiler = true
-
 // validSIGPROF compares this signal delivery's code against the signal sources
 // that the profiler uses, returning whether the delivery should be processed.
 // To be processed, a signal delivery from a known profiling mechanism should
@@ -593,7 +607,7 @@ func validSIGPROF(mp *m, c *sigctxt) bool {
 
 	// Having an M means the thread interacts with the Go scheduler, and we can
 	// check whether there's an active per-thread timer for this thread.
-	if atomic.Load(&mp.profileTimerValid) != 0 {
+	if mp.profileTimerValid.Load() {
 		// If this M has its own per-thread CPU profiling interval timer, we
 		// should track the SIGPROF signals that come from that timer (for
 		// accurate reporting of its CPU usage; see issue 35057) and ignore any
@@ -614,14 +628,10 @@ func setThreadCPUProfiler(hz int32) {
 	mp := getg().m
 	mp.profilehz = hz
 
-	if !go118UseTimerCreateProfiler {
-		return
-	}
-
 	// destroy any active timer
-	if atomic.Load(&mp.profileTimerValid) != 0 {
+	if mp.profileTimerValid.Load() {
 		timerid := mp.profileTimer
-		atomic.Store(&mp.profileTimerValid, 0)
+		mp.profileTimerValid.Store(false)
 		mp.profileTimer = 0
 
 		ret := timer_delete(timerid)
@@ -645,7 +655,7 @@ func setThreadCPUProfiler(hz int32) {
 	// spend shows up as a 10% chance of one sample (for an expected value of
 	// 0.1 samples), and so that "two and six tenths" periods of CPU spend show
 	// up as a 60% chance of 3 samples and a 40% chance of 2 samples (for an
-	// expected value of 2.6). Set the initial delay to a value in the unifom
+	// expected value of 2.6). Set the initial delay to a value in the uniform
 	// random distribution between 0 and the desired period. And because "0"
 	// means "disable timer", add 1 so the half-open interval [0,period) turns
 	// into (0,period].
@@ -656,7 +666,7 @@ func setThreadCPUProfiler(hz int32) {
 	// activates may do a couple milliseconds of GC-related work and nothing
 	// else in the few seconds that the profiler observes.
 	spec := new(itimerspec)
-	spec.it_value.setNsec(1 + int64(fastrandn(uint32(1e9/hz))))
+	spec.it_value.setNsec(1 + int64(cheaprandn(uint32(1e9/hz))))
 	spec.it_interval.setNsec(1e9 / int64(hz))
 
 	var timerid int32
@@ -681,7 +691,7 @@ func setThreadCPUProfiler(hz int32) {
 	}
 
 	mp.profileTimer = timerid
-	atomic.Store(&mp.profileTimerValid, 1)
+	mp.profileTimerValid.Store(true)
 }
 
 // perThreadSyscallArgs contains the system call number, arguments, and
@@ -726,7 +736,7 @@ func syscall_runtime_doAllThreadsSyscall(trap, a1, a2, a3, a4, a5, a6 uintptr) (
 	// N.B. Internally, this function does not depend on STW to
 	// successfully change every thread. It is only needed for user
 	// expectations, per above.
-	stopTheWorld("doAllThreadsSyscall")
+	stw := stopTheWorld(stwAllThreadsSyscall)
 
 	// This function depends on several properties:
 	//
@@ -770,7 +780,7 @@ func syscall_runtime_doAllThreadsSyscall(trap, a1, a2, a3, a4, a5, a6 uintptr) (
 	if errno != 0 {
 		releasem(getg().m)
 		allocmLock.unlock()
-		startTheWorld()
+		startTheWorld(stw)
 		return r1, r2, errno
 	}
 
@@ -855,7 +865,7 @@ func syscall_runtime_doAllThreadsSyscall(trap, a1, a2, a3, a4, a5, a6 uintptr) (
 
 	releasem(getg().m)
 	allocmLock.unlock()
-	startTheWorld()
+	startTheWorld(stw)
 
 	return r1, r2, errno
 }
@@ -864,6 +874,7 @@ func syscall_runtime_doAllThreadsSyscall(trap, a1, a2, a3, a4, a5, a6 uintptr) (
 //
 // This function throws if the system call returns with anything other than the
 // expected values.
+//
 //go:nosplit
 func runPerThreadSyscall() {
 	gp := getg()
@@ -879,9 +890,38 @@ func runPerThreadSyscall() {
 	}
 	if errno != 0 || r1 != args.r1 || r2 != args.r2 {
 		print("trap:", args.trap, ", a123456=[", args.a1, ",", args.a2, ",", args.a3, ",", args.a4, ",", args.a5, ",", args.a6, "]\n")
-		print("results: got {r1=", r1, ",r2=", r2, ",errno=", errno, "}, want {r1=", args.r1, ",r2=", args.r2, ",errno=0\n")
+		print("results: got {r1=", r1, ",r2=", r2, ",errno=", errno, "}, want {r1=", args.r1, ",r2=", args.r2, ",errno=0}\n")
 		fatal("AllThreadsSyscall6 results differ between threads; runtime corrupted")
 	}
 
 	gp.m.needPerThreadSyscall.Store(0)
+}
+
+const (
+	_SI_USER     = 0
+	_SI_TKILL    = -6
+	_SYS_SECCOMP = 1
+)
+
+// sigFromUser reports whether the signal was sent because of a call
+// to kill or tgkill.
+//
+//go:nosplit
+func (c *sigctxt) sigFromUser() bool {
+	code := int32(c.sigcode())
+	return code == _SI_USER || code == _SI_TKILL
+}
+
+// sigFromSeccomp reports whether the signal was sent from seccomp.
+//
+//go:nosplit
+func (c *sigctxt) sigFromSeccomp() bool {
+	code := int32(c.sigcode())
+	return code == _SYS_SECCOMP
+}
+
+//go:nosplit
+func mprotect(addr unsafe.Pointer, n uintptr, prot int32) (ret int32, errno int32) {
+	r, _, err := syscall.Syscall6(syscall.SYS_MPROTECT, uintptr(addr), n, uintptr(prot), 0, 0, 0)
+	return int32(r), int32(err)
 }

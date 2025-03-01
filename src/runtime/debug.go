@@ -5,13 +5,13 @@
 package runtime
 
 import (
-	"runtime/internal/atomic"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
 // GOMAXPROCS sets the maximum number of CPUs that can be executing
 // simultaneously and returns the previous setting. It defaults to
-// the value of runtime.NumCPU. If n < 1, it does not change the current setting.
+// the value of [runtime.NumCPU]. If n < 1, it does not change the current setting.
 // This call will go away when the scheduler improves.
 func GOMAXPROCS(n int) int {
 	if GOARCH == "wasm" && n > 1 {
@@ -25,12 +25,12 @@ func GOMAXPROCS(n int) int {
 		return ret
 	}
 
-	stopTheWorldGC("GOMAXPROCS")
+	stw := stopTheWorldGC(stwGOMAXPROCS)
 
 	// newprocs will be processed by startTheWorld
 	newprocs = int32(n)
 
-	startTheWorldGC()
+	startTheWorldGC(stw)
 	return ret
 }
 
@@ -50,6 +50,17 @@ func NumCgoCall() int64 {
 		n += int64(mp.ncgocall)
 	}
 	return n
+}
+
+func totalMutexWaitTimeNanos() int64 {
+	total := sched.totalMutexWaitTime.Load()
+
+	total += sched.totalRuntimeLockWaitTime.Load()
+	for mp := (*m)(atomic.Loadp(unsafe.Pointer(&allm))); mp != nil; mp = mp.alllink {
+		total += mp.mLockProfile.waitTime.Load()
+	}
+
+	return total
 }
 
 // NumGoroutine returns the number of goroutines that currently exist.
@@ -85,13 +96,13 @@ func debug_modinfo() string {
 //go:linkname mayMoreStackPreempt
 func mayMoreStackPreempt() {
 	// Don't do anything on the g0 or gsignal stack.
-	g := getg()
-	if g == g.m.g0 || g == g.m.gsignal {
+	gp := getg()
+	if gp == gp.m.g0 || gp == gp.m.gsignal {
 		return
 	}
 	// Force a preemption, unless the stack is already poisoned.
-	if g.stackguard0 < stackPoisonMin {
-		g.stackguard0 = stackPreempt
+	if gp.stackguard0 < stackPoisonMin {
+		gp.stackguard0 = stackPreempt
 	}
 }
 
@@ -104,12 +115,31 @@ func mayMoreStackPreempt() {
 //go:linkname mayMoreStackMove
 func mayMoreStackMove() {
 	// Don't do anything on the g0 or gsignal stack.
-	g := getg()
-	if g == g.m.g0 || g == g.m.gsignal {
+	gp := getg()
+	if gp == gp.m.g0 || gp == gp.m.gsignal {
 		return
 	}
 	// Force stack movement, unless the stack is already poisoned.
-	if g.stackguard0 < stackPoisonMin {
-		g.stackguard0 = stackForceMove
+	if gp.stackguard0 < stackPoisonMin {
+		gp.stackguard0 = stackForceMove
 	}
+}
+
+// debugPinnerKeepUnpin is used to make runtime.(*Pinner).Unpin reachable.
+var debugPinnerKeepUnpin bool = false
+
+// debugPinnerV1 returns a new Pinner that pins itself. This function can be
+// used by debuggers to easily obtain a Pinner that will not be garbage
+// collected (or moved in memory) even if no references to it exist in the
+// target program. This pinner in turn can be used to extend this property
+// to other objects, which debuggers can use to simplify the evaluation of
+// expressions involving multiple call injections.
+func debugPinnerV1() *Pinner {
+	p := new(Pinner)
+	p.Pin(unsafe.Pointer(p))
+	if debugPinnerKeepUnpin {
+		// Make Unpin reachable.
+		p.Unpin()
+	}
+	return p
 }

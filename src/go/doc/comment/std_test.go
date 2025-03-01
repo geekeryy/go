@@ -7,14 +7,13 @@ package comment
 import (
 	"internal/diff"
 	"internal/testenv"
-	"os/exec"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 )
 
 func TestStd(t *testing.T) {
-	out, err := exec.Command(testenv.GoToolPath(t), "list", "std").CombinedOutput()
+	out, err := testenv.Command(t, testenv.GoToolPath(t), "list", "std").CombinedOutput()
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -25,7 +24,7 @@ func TestStd(t *testing.T) {
 			list = append(list, pkg)
 		}
 	}
-	sort.Strings(list)
+	slices.Sort(list)
 
 	have := strings.Join(stdPkgs, "\n") + "\n"
 	want := strings.Join(list, "\n") + "\n"

@@ -242,10 +242,6 @@ func parseArmAttributes(e binary.ByteOrder, data []byte) (found bool, ehdrFlags 
 // object, and the returned ehdrFlags contains what this Load function computes.
 // TODO: find a better place for this logic.
 func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, pkg string, length int64, pn string, initEhdrFlags uint32) (textp []loader.Sym, ehdrFlags uint32, err error) {
-	newSym := func(name string, version int) loader.Sym {
-		return l.CreateStaticSym(name)
-	}
-	lookup := l.LookupOrCreateCgoExport
 	errorf := func(str string, args ...interface{}) ([]loader.Sym, uint32, error) {
 		return nil, 0, fmt.Errorf("loadelf: %s: %v", pn, fmt.Sprintf(str, args...))
 	}
@@ -345,6 +341,10 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 	case sys.MIPS64:
 		if mach != elf.EM_MIPS || class != elf.ELFCLASS64 {
 			return errorf("elf object but not mips64")
+		}
+	case sys.Loong64:
+		if mach != elf.EM_LOONGARCH || class != elf.ELFCLASS64 {
+			return errorf("elf object but not loong64")
 		}
 
 	case sys.ARM:
@@ -511,7 +511,7 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 		}
 		sectsymNames[name] = true
 
-		sb := l.MakeSymbolUpdater(lookup(name, localSymVersion))
+		sb := l.MakeSymbolUpdater(l.LookupOrCreateCgoExport(name, localSymVersion))
 
 		switch sect.flags & (elf.SHF_ALLOC | elf.SHF_WRITE | elf.SHF_EXECINSTR) {
 		default:
@@ -536,6 +536,7 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 		}
 		if sect.type_ == elf.SHT_PROGBITS {
 			sb.SetData(sect.base[:sect.size])
+			sb.SetExternal(true)
 		}
 
 		sb.SetSize(int64(sect.size))
@@ -551,7 +552,7 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 
 	for i := 1; i < elfobj.nsymtab; i++ {
 		var elfsym ElfSym
-		if err := readelfsym(newSym, lookup, l, arch, elfobj, i, &elfsym, 1, localSymVersion); err != nil {
+		if err := readelfsym(l, arch, elfobj, i, &elfsym, 1, localSymVersion); err != nil {
 			return errorf("%s: malformed elf file: %v", pn, err)
 		}
 		symbols[i] = elfsym.sym
@@ -579,27 +580,41 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 		}
 		sect = &elfobj.sect[elfsym.shndx]
 		if sect.sym == 0 {
-			if strings.HasPrefix(elfsym.name, ".Linfo_string") { // clang does this
+			if elfsym.type_ == 0 {
+				if strings.HasPrefix(sect.name, ".debug_") && elfsym.name == "" {
+					// clang on arm and riscv64.
+					// This reportedly happens with clang 3.7 on ARM.
+					// See issue 13139.
+					continue
+				}
+				if strings.HasPrefix(elfsym.name, ".Ldebug_") || elfsym.name == ".L0 " {
+					// gcc on riscv64.
+					continue
+				}
+				if elfsym.name == ".Lline_table_start0" {
+					// clang on riscv64.
+					continue
+				}
+
+				if strings.HasPrefix(elfsym.name, "$d") && sect.name == ".debug_frame" {
+					// "$d" is a marker, not a real symbol.
+					// This happens with gcc on ARM64.
+					// See https://sourceware.org/bugzilla/show_bug.cgi?id=21809
+					continue
+				}
+			}
+
+			if strings.HasPrefix(elfsym.name, ".Linfo_string") {
+				// clang does this
 				continue
 			}
 
-			if elfsym.name == "" && elfsym.type_ == 0 && sect.name == ".debug_str" {
-				// This reportedly happens with clang 3.7 on ARM.
-				// See issue 13139.
+			if strings.HasPrefix(elfsym.name, ".LASF") || strings.HasPrefix(elfsym.name, ".LLRL") || strings.HasPrefix(elfsym.name, ".LLST") {
+				// gcc on s390x and riscv64 does this.
 				continue
 			}
 
-			if strings.HasPrefix(elfsym.name, "$d") && elfsym.type_ == 0 && sect.name == ".debug_frame" {
-				// "$d" is a marker, not a real symbol.
-				// This happens with gcc on ARM64.
-				// See https://sourceware.org/bugzilla/show_bug.cgi?id=21809
-				continue
-			}
-
-			if strings.HasPrefix(elfsym.name, ".LASF") { // gcc on s390x does this
-				continue
-			}
-			return errorf("%v: sym#%d (%s): ignoring symbol in section %d (type %d)", elfsym.sym, i, elfsym.name, elfsym.shndx, elfsym.type_)
+			return errorf("%v: sym#%d (%q): ignoring symbol in section %d (%q) (type %d)", elfsym.sym, i, elfsym.name, elfsym.shndx, sect.name, elfsym.type_)
 		}
 
 		s := elfsym.sym
@@ -621,7 +636,7 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 		}
 		sb.SetValue(int64(elfsym.value))
 		sb.SetSize(int64(elfsym.size))
-		if sectsb.Type() == sym.STEXT {
+		if sectsb.Type().IsText() {
 			if l.AttrExternal(s) && !l.AttrDuplicateOK(s) {
 				return errorf("%s: duplicate symbol definition", sb.Name())
 			}
@@ -630,10 +645,20 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 
 		if elf.Machine(elfobj.machine) == elf.EM_PPC64 {
 			flag := int(elfsym.other) >> 5
-			if 2 <= flag && flag <= 6 {
-				l.SetSymLocalentry(s, 1<<uint(flag-2))
-			} else if flag == 7 {
+			switch flag {
+			case 0:
+				// No local entry. R2 is preserved.
+			case 1:
+				// This is kind of a hack, but pass the hint about this symbol's
+				// usage of R2 (R2 is a caller-save register not a TOC pointer, and
+				// this function does not have a distinct local entry) by setting
+				// its SymLocalentry to 1.
+				l.SetSymLocalentry(s, 1)
+			case 7:
 				return errorf("%s: invalid sym.other 0x%x", sb.Name(), elfsym.other)
+			default:
+				// Convert the word sized offset into bytes.
+				l.SetSymLocalentry(s, 4<<uint(flag-2))
 			}
 		}
 	}
@@ -649,7 +674,7 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 		if l.SubSym(s) != 0 {
 			sb.SortSub()
 		}
-		if sb.Type() == sym.STEXT {
+		if sb.Type().IsText() {
 			if l.AttrOnList(s) {
 				return errorf("symbol %s listed multiple times",
 					l.SymName(s))
@@ -741,7 +766,7 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 				rSym = 0
 			} else {
 				var elfsym ElfSym
-				if err := readelfsym(newSym, lookup, l, arch, elfobj, int(symIdx), &elfsym, 0, 0); err != nil {
+				if err := readelfsym(l, arch, elfobj, int(symIdx), &elfsym, 0, 0); err != nil {
 					return errorf("malformed elf file: %v", err)
 				}
 				elfsym.sym = symbols[symIdx]
@@ -818,7 +843,7 @@ func elfmap(elfobj *ElfObj, sect *ElfSect) (err error) {
 	return nil
 }
 
-func readelfsym(newSym, lookup func(string, int) loader.Sym, l *loader.Loader, arch *sys.Arch, elfobj *ElfObj, i int, elfsym *ElfSym, needSym int, localSymVersion int) (err error) {
+func readelfsym(l *loader.Loader, arch *sys.Arch, elfobj *ElfObj, i int, elfsym *ElfSym, needSym int, localSymVersion int) (err error) {
 	if i >= elfobj.nsymtab || i < 0 {
 		err = fmt.Errorf("invalid elf symbol index")
 		return err
@@ -869,7 +894,7 @@ func readelfsym(newSym, lookup func(string, int) loader.Sym, l *loader.Loader, a
 		switch elfsym.bind {
 		case elf.STB_GLOBAL:
 			if needSym != 0 {
-				s = lookup(elfsym.name, 0)
+				s = l.LookupOrCreateCgoExport(elfsym.name, 0)
 
 				// for global scoped hidden symbols we should insert it into
 				// symbol hash table, but mark them as hidden.
@@ -898,7 +923,7 @@ func readelfsym(newSym, lookup func(string, int) loader.Sym, l *loader.Loader, a
 				// We need to be able to look this up,
 				// so put it in the hash table.
 				if needSym != 0 {
-					s = lookup(elfsym.name, localSymVersion)
+					s = l.LookupOrCreateCgoExport(elfsym.name, localSymVersion)
 					l.SetAttrVisibilityHidden(s, true)
 				}
 				break
@@ -911,13 +936,13 @@ func readelfsym(newSym, lookup func(string, int) loader.Sym, l *loader.Loader, a
 				// FIXME: pass empty string here for name? This would
 				// reduce mem use, but also (possibly) make it harder
 				// to debug problems.
-				s = newSym(elfsym.name, localSymVersion)
+				s = l.CreateStaticSym(elfsym.name)
 				l.SetAttrVisibilityHidden(s, true)
 			}
 
 		case elf.STB_WEAK:
 			if needSym != 0 {
-				s = lookup(elfsym.name, 0)
+				s = l.LookupOrCreateCgoExport(elfsym.name, 0)
 				if elfsym.other == 2 {
 					l.SetAttrVisibilityHidden(s, true)
 				}
@@ -956,6 +981,7 @@ func relSize(arch *sys.Arch, pn string, elftype uint32) (uint8, uint8, error) {
 		ARM     = uint32(sys.ARM)
 		ARM64   = uint32(sys.ARM64)
 		I386    = uint32(sys.I386)
+		LOONG64 = uint32(sys.Loong64)
 		MIPS    = uint32(sys.MIPS)
 		MIPS64  = uint32(sys.MIPS64)
 		PPC64   = uint32(sys.PPC64)
@@ -988,8 +1014,33 @@ func relSize(arch *sys.Arch, pn string, elftype uint32) (uint8, uint8, error) {
 		MIPS64 | uint32(elf.R_MIPS_CALL16)<<16,
 		MIPS64 | uint32(elf.R_MIPS_GPREL32)<<16,
 		MIPS64 | uint32(elf.R_MIPS_64)<<16,
-		MIPS64 | uint32(elf.R_MIPS_GOT_DISP)<<16:
+		MIPS64 | uint32(elf.R_MIPS_GOT_DISP)<<16,
+		MIPS64 | uint32(elf.R_MIPS_PC32)<<16:
 		return 4, 4, nil
+
+	case LOONG64 | uint32(elf.R_LARCH_ADD8)<<16,
+		LOONG64 | uint32(elf.R_LARCH_SUB8)<<16:
+		return 1, 1, nil
+
+	case LOONG64 | uint32(elf.R_LARCH_ADD16)<<16,
+		LOONG64 | uint32(elf.R_LARCH_SUB16)<<16:
+		return 2, 2, nil
+
+	case LOONG64 | uint32(elf.R_LARCH_MARK_LA)<<16,
+		LOONG64 | uint32(elf.R_LARCH_MARK_PCREL)<<16,
+		LOONG64 | uint32(elf.R_LARCH_ADD24)<<16,
+		LOONG64 | uint32(elf.R_LARCH_ADD32)<<16,
+		LOONG64 | uint32(elf.R_LARCH_SUB24)<<16,
+		LOONG64 | uint32(elf.R_LARCH_SUB32)<<16,
+		LOONG64 | uint32(elf.R_LARCH_B26)<<16,
+		LOONG64 | uint32(elf.R_LARCH_32_PCREL)<<16:
+		return 4, 4, nil
+
+	case LOONG64 | uint32(elf.R_LARCH_64)<<16,
+		LOONG64 | uint32(elf.R_LARCH_ADD64)<<16,
+		LOONG64 | uint32(elf.R_LARCH_SUB64)<<16,
+		LOONG64 | uint32(elf.R_LARCH_64_PCREL)<<16:
+		return 8, 8, nil
 
 	case S390X | uint32(elf.R_390_8)<<16:
 		return 1, 1, nil
@@ -1039,6 +1090,8 @@ func relSize(arch *sys.Arch, pn string, elftype uint32) (uint8, uint8, error) {
 		I386 | uint32(elf.R_386_GOTPC)<<16,
 		I386 | uint32(elf.R_386_GOT32X)<<16,
 		PPC64 | uint32(elf.R_PPC64_REL24)<<16,
+		PPC64 | uint32(elf.R_PPC64_REL24_NOTOC)<<16,
+		PPC64 | uint32(elf.R_PPC64_REL24_P9NOTOC)<<16,
 		PPC64 | uint32(elf.R_PPC_REL32)<<16,
 		S390X | uint32(elf.R_390_32)<<16,
 		S390X | uint32(elf.R_390_PC32)<<16,
@@ -1055,6 +1108,9 @@ func relSize(arch *sys.Arch, pn string, elftype uint32) (uint8, uint8, error) {
 		ARM64 | uint32(elf.R_AARCH64_ABS64)<<16,
 		ARM64 | uint32(elf.R_AARCH64_PREL64)<<16,
 		PPC64 | uint32(elf.R_PPC64_ADDR64)<<16,
+		PPC64 | uint32(elf.R_PPC64_PCREL34)<<16,
+		PPC64 | uint32(elf.R_PPC64_GOT_PCREL34)<<16,
+		PPC64 | uint32(elf.R_PPC64_PLT_PCREL34_NOTOC)<<16,
 		S390X | uint32(elf.R_390_GLOB_DAT)<<16,
 		S390X | uint32(elf.R_390_RELATIVE)<<16,
 		S390X | uint32(elf.R_390_GOTOFF)<<16,
@@ -1065,8 +1121,16 @@ func relSize(arch *sys.Arch, pn string, elftype uint32) (uint8, uint8, error) {
 		S390X | uint32(elf.R_390_PLT64)<<16:
 		return 8, 8, nil
 
+	case RISCV64 | uint32(elf.R_RISCV_SET6)<<16,
+		RISCV64 | uint32(elf.R_RISCV_SUB6)<<16,
+		RISCV64 | uint32(elf.R_RISCV_SET8)<<16,
+		RISCV64 | uint32(elf.R_RISCV_SUB8)<<16:
+		return 1, 1, nil
+
 	case RISCV64 | uint32(elf.R_RISCV_RVC_BRANCH)<<16,
-		RISCV64 | uint32(elf.R_RISCV_RVC_JUMP)<<16:
+		RISCV64 | uint32(elf.R_RISCV_RVC_JUMP)<<16,
+		RISCV64 | uint32(elf.R_RISCV_SET16)<<16,
+		RISCV64 | uint32(elf.R_RISCV_SUB16)<<16:
 		return 2, 2, nil
 
 	case RISCV64 | uint32(elf.R_RISCV_32)<<16,
@@ -1078,6 +1142,10 @@ func relSize(arch *sys.Arch, pn string, elftype uint32) (uint8, uint8, error) {
 		RISCV64 | uint32(elf.R_RISCV_PCREL_HI20)<<16,
 		RISCV64 | uint32(elf.R_RISCV_PCREL_LO12_I)<<16,
 		RISCV64 | uint32(elf.R_RISCV_PCREL_LO12_S)<<16,
+		RISCV64 | uint32(elf.R_RISCV_ADD32)<<16,
+		RISCV64 | uint32(elf.R_RISCV_SET32)<<16,
+		RISCV64 | uint32(elf.R_RISCV_SUB32)<<16,
+		RISCV64 | uint32(elf.R_RISCV_32_PCREL)<<16,
 		RISCV64 | uint32(elf.R_RISCV_RELAX)<<16:
 		return 4, 4, nil
 
@@ -1093,8 +1161,19 @@ func relSize(arch *sys.Arch, pn string, elftype uint32) (uint8, uint8, error) {
 		PPC64 | uint32(elf.R_PPC64_TOC16_LO_DS)<<16,
 		PPC64 | uint32(elf.R_PPC64_REL16_LO)<<16,
 		PPC64 | uint32(elf.R_PPC64_REL16_HI)<<16,
-		PPC64 | uint32(elf.R_PPC64_REL16_HA)<<16:
+		PPC64 | uint32(elf.R_PPC64_REL16_HA)<<16,
+		PPC64 | uint32(elf.R_PPC64_PLT16_HA)<<16,
+		PPC64 | uint32(elf.R_PPC64_PLT16_LO_DS)<<16:
 		return 2, 4, nil
+
+	// PPC64 inline PLT sequence hint relocations (-fno-plt)
+	// These are informational annotations to assist linker optimizations.
+	case PPC64 | uint32(elf.R_PPC64_PLTSEQ)<<16,
+		PPC64 | uint32(elf.R_PPC64_PLTCALL)<<16,
+		PPC64 | uint32(elf.R_PPC64_PLTCALL_NOTOC)<<16,
+		PPC64 | uint32(elf.R_PPC64_PLTSEQ_NOTOC)<<16:
+		return 0, 0, nil
+
 	}
 }
 

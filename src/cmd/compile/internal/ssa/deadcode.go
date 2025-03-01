@@ -9,12 +9,12 @@ import (
 )
 
 // findlive returns the reachable blocks and live values in f.
-// The caller should call f.retDeadcodeLive(live) when it is done with it.
+// The caller should call f.Cache.freeBoolSlice(live) when it is done with it.
 func findlive(f *Func) (reachable []bool, live []bool) {
 	reachable = ReachableBlocks(f)
 	var order []*Value
 	live, order = liveValues(f, reachable)
-	f.retDeadcodeLiveOrderStmts(order)
+	f.Cache.freeValueSlice(order)
 	return
 }
 
@@ -51,21 +51,11 @@ func ReachableBlocks(f *Func) []bool {
 // to be statements in reversed data flow order.
 // The second result is used to help conserve statement boundaries for debugging.
 // reachable is a map from block ID to whether the block is reachable.
-// The caller should call f.retDeadcodeLive(live) and f.retDeadcodeLiveOrderStmts(liveOrderStmts)
+// The caller should call f.Cache.freeBoolSlice(live) and f.Cache.freeValueSlice(liveOrderStmts).
 // when they are done with the return values.
 func liveValues(f *Func, reachable []bool) (live []bool, liveOrderStmts []*Value) {
-	live = f.newDeadcodeLive()
-	if cap(live) < f.NumValues() {
-		live = make([]bool, f.NumValues())
-	} else {
-		live = live[:f.NumValues()]
-		for i := range live {
-			live[i] = false
-		}
-	}
-
-	liveOrderStmts = f.newDeadcodeLiveOrderStmts()
-	liveOrderStmts = liveOrderStmts[:0]
+	live = f.Cache.allocBoolSlice(f.NumValues())
+	liveOrderStmts = f.Cache.allocValueSlice(f.NumValues())[:0]
 
 	// After regalloc, consider all values to be live.
 	// See the comment at the top of regalloc.go and in deadcode for details.
@@ -101,8 +91,8 @@ func liveValues(f *Func, reachable []bool) (live []bool, liveOrderStmts []*Value
 	}
 
 	// Find all live values
-	q := f.Cache.deadcode.q[:0]
-	defer func() { f.Cache.deadcode.q = q }()
+	q := f.Cache.allocValueSlice(f.NumValues())[:0]
+	defer f.Cache.freeValueSlice(q)
 
 	// Starting set: all control values of reachable blocks are live.
 	// Calls are live (because callee can observe the memory state).
@@ -120,16 +110,15 @@ func liveValues(f *Func, reachable []bool) (live []bool, liveOrderStmts []*Value
 			}
 		}
 		for _, v := range b.Values {
-			if (opcodeTable[v.Op].call || opcodeTable[v.Op].hasSideEffects) && !live[v.ID] {
+			if (opcodeTable[v.Op].call || opcodeTable[v.Op].hasSideEffects || opcodeTable[v.Op].nilCheck) && !live[v.ID] {
 				live[v.ID] = true
 				q = append(q, v)
 				if v.Pos.IsStmt() != src.PosNotStmt {
 					liveOrderStmts = append(liveOrderStmts, v)
 				}
 			}
-			if v.Type.IsVoid() && !live[v.ID] {
-				// The only Void ops are nil checks and inline marks.  We must keep these.
-				if v.Op == OpInlMark && !liveInlIdx[int(v.AuxInt)] {
+			if v.Op == OpInlMark {
+				if !liveInlIdx[int(v.AuxInt)] {
 					// We don't need marks for bodies that
 					// have been completely optimized away.
 					// TODO: save marks only for bodies which
@@ -149,6 +138,7 @@ func liveValues(f *Func, reachable []bool) (live []bool, liveOrderStmts []*Value
 	for len(q) > 0 {
 		// pop a reachable value
 		v := q[len(q)-1]
+		q[len(q)-1] = nil
 		q = q[:len(q)-1]
 		for i, x := range v.Args {
 			if v.Op == OpPhi && !reachable[v.Block.Preds[i].b.ID] {
@@ -213,8 +203,8 @@ func deadcode(f *Func) {
 
 	// Find live values.
 	live, order := liveValues(f, reachable)
-	defer f.retDeadcodeLive(live)
-	defer f.retDeadcodeLiveOrderStmts(order)
+	defer func() { f.Cache.freeBoolSlice(live) }()
+	defer func() { f.Cache.freeValueSlice(order) }()
 
 	// Remove dead & duplicate entries from namedValues map.
 	s := f.newSparseSet(f.NumValues())
@@ -299,20 +289,6 @@ func deadcode(f *Func) {
 		b.truncateValues(i)
 	}
 
-	// Remove dead blocks from WBLoads list.
-	i = 0
-	for _, b := range f.WBLoads {
-		if reachable[b.ID] {
-			f.WBLoads[i] = b
-			i++
-		}
-	}
-	clearWBLoads := f.WBLoads[i:]
-	for j := range clearWBLoads {
-		clearWBLoads[j] = nil
-	}
-	f.WBLoads = f.WBLoads[:i]
-
 	// Remove unreachable blocks. Return dead blocks to allocator.
 	i = 0
 	for _, b := range f.Blocks {
@@ -336,6 +312,8 @@ func deadcode(f *Func) {
 
 // removeEdge removes the i'th outgoing edge from b (and
 // the corresponding incoming edge from b.Succs[i].b).
+// Note that this potentially reorders successors of b, so it
+// must be used very carefully.
 func (b *Block) removeEdge(i int) {
 	e := b.Succs[i]
 	c := e.b
@@ -353,7 +331,6 @@ func (b *Block) removeEdge(i int) {
 			continue
 		}
 		c.removePhiArg(v, j)
-		phielimValue(v)
 		// Note: this is trickier than it looks. Replacing
 		// a Phi with a Copy can in general cause problems because
 		// Phi and Copy don't have exactly the same semantics.

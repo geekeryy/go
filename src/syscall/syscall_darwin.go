@@ -113,6 +113,15 @@ func libc_getfsstat_trampoline()
 
 //go:cgo_import_dynamic libc_getfsstat getfsstat "/usr/lib/libSystem.B.dylib"
 
+// utimensat should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/tetratelabs/wazero
+//
+// See go.dev/issue/67401.
+//
+//go:linkname utimensat
+
 //sys	utimensat(dirfd int, path string, times *[2]Timespec, flags int) (err error)
 
 /*
@@ -171,6 +180,7 @@ func Kill(pid int, signum Signal) (err error) { return kill(pid, int(signum), 1)
 //sys	Mlock(b []byte) (err error)
 //sys	Mlockall(flags int) (err error)
 //sys	Mprotect(b []byte, prot int) (err error)
+//sys	msync(b []byte, flags int) (err error)
 //sys	Munlock(b []byte) (err error)
 //sys	Munlockall() (err error)
 //sys	Open(path string, mode int, perm uint32) (fd int, err error)
@@ -194,7 +204,7 @@ func Kill(pid int, signum Signal) (err error) { return kill(pid, int(signum), 1)
 //sys	Setprivexec(flag int) (err error)
 //sysnb	Setregid(rgid int, egid int) (err error)
 //sysnb	Setreuid(ruid int, euid int) (err error)
-//sysnb	Setrlimit(which int, lim *Rlimit) (err error)
+//sysnb	setrlimit(which int, lim *Rlimit) (err error)
 //sysnb	Setsid() (pid int, err error)
 //sysnb	Settimeofday(tp *Timeval) (err error)
 //sysnb	Setuid(uid int) (err error)
@@ -210,12 +220,9 @@ func Kill(pid int, signum Signal) (err error) { return kill(pid, int(signum), 1)
 //sys   mmap(addr uintptr, length uintptr, prot int, flag int, fd int, pos int64) (ret uintptr, err error)
 //sys   munmap(addr uintptr, length uintptr) (err error)
 //sysnb fork() (pid int, err error)
-//sysnb ioctl(fd int, req int, arg int) (err error)
-//sysnb ioctlPtr(fd int, req uint, arg unsafe.Pointer) (err error) = SYS_ioctl
 //sysnb execve(path *byte, argv **byte, envp **byte) (err error)
 //sysnb exit(res int) (err error)
 //sys	sysctl(mib []_C_int, old *byte, oldlen *uintptr, new *byte, newlen uintptr) (err error)
-//sys	fcntlPtr(fd int, cmd int, arg unsafe.Pointer) (val int, err error) = SYS_fcntl
 //sys   unlinkat(fd int, path string, flags int) (err error)
 //sys   openat(fd int, path string, flags int, perm uint32) (fdret int, err error)
 //sys	getcwd(buf []byte) (n int, err error)
@@ -226,7 +233,7 @@ func init() {
 
 func fdopendir(fd int) (dir uintptr, err error) {
 	r0, _, e1 := syscallPtr(abi.FuncPCABI0(libc_fdopendir_trampoline), uintptr(fd), 0, 0)
-	dir = uintptr(r0)
+	dir = r0
 	if e1 != 0 {
 		err = errnoErr(e1)
 	}
@@ -239,15 +246,6 @@ func libc_fdopendir_trampoline()
 
 func readlen(fd int, buf *byte, nbuf int) (n int, err error) {
 	r0, _, e1 := syscall(abi.FuncPCABI0(libc_read_trampoline), uintptr(fd), uintptr(unsafe.Pointer(buf)), uintptr(nbuf))
-	n = int(r0)
-	if e1 != 0 {
-		err = errnoErr(e1)
-	}
-	return
-}
-
-func writelen(fd int, buf *byte, nbuf int) (n int, err error) {
-	r0, _, e1 := syscall(abi.FuncPCABI0(libc_write_trampoline), uintptr(fd), uintptr(unsafe.Pointer(buf)), uintptr(nbuf))
 	n = int(r0)
 	if e1 != 0 {
 		err = errnoErr(e1)
@@ -310,12 +308,7 @@ func Getdirentries(fd int, buf []byte, basep *uintptr) (n int, err error) {
 			break
 		}
 		// Copy entry into return buffer.
-		s := struct {
-			ptr unsafe.Pointer
-			siz int
-			cap int
-		}{ptr: unsafe.Pointer(&entry), siz: reclen, cap: reclen}
-		copy(buf, *(*[]byte)(unsafe.Pointer(&s)))
+		copy(buf, unsafe.Slice((*byte)(unsafe.Pointer(&entry)), reclen))
 		buf = buf[reclen:]
 		n += reclen
 		cnt++

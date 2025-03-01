@@ -5,7 +5,6 @@
 package ssa
 
 import (
-	"bytes"
 	"cmd/internal/src"
 	"fmt"
 	"hash/crc32"
@@ -152,7 +151,7 @@ func Compile(f *Func) {
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
-		buf := new(bytes.Buffer)
+		buf := new(strings.Builder)
 		fmt.Fprintf(buf, "%s: ", f.Name)
 		for _, key := range keys {
 			fmt.Fprintf(buf, "%s=%d ", key, f.ruleMatches[key])
@@ -329,7 +328,7 @@ commas. For example:
 		switch flag {
 		case "on":
 			checkEnabled = val != 0
-			debugPoset = checkEnabled // also turn on advanced self-checking in prove's datastructure
+			debugPoset = checkEnabled // also turn on advanced self-checking in prove's data structure
 			return ""
 		case "off":
 			checkEnabled = val == 0
@@ -456,10 +455,8 @@ commas. For example:
 
 // list of passes for the compiler
 var passes = [...]pass{
-	// TODO: combine phielim and copyelim into a single pass?
 	{name: "number lines", fn: numberLines, required: true},
-	{name: "early phielim", fn: phielim},
-	{name: "early copyelim", fn: copyelim},
+	{name: "early phielim and copyelim", fn: copyelim},
 	{name: "early deadcode", fn: deadcode}, // remove generated dead code to avoid doing pointless work during opt
 	{name: "short circuit", fn: shortcircuit},
 	{name: "decompose user", fn: decomposeUser, required: true},
@@ -473,30 +470,33 @@ var passes = [...]pass{
 	{name: "nilcheckelim", fn: nilcheckelim},
 	{name: "prove", fn: prove},
 	{name: "early fuse", fn: fuseEarly},
-	{name: "decompose builtin", fn: decomposeBuiltIn, required: true},
 	{name: "expand calls", fn: expandCalls, required: true},
+	{name: "decompose builtin", fn: postExpandCallsDecompose, required: true},
 	{name: "softfloat", fn: softfloat, required: true},
 	{name: "late opt", fn: opt, required: true}, // TODO: split required rules and optimizing rules
 	{name: "dead auto elim", fn: elimDeadAutosGeneric},
+	{name: "sccp", fn: sccp},
 	{name: "generic deadcode", fn: deadcode, required: true}, // remove dead stores, which otherwise mess up store chain
-	{name: "check bce", fn: checkbce},
 	{name: "branchelim", fn: branchelim},
 	{name: "late fuse", fn: fuseLate},
+	{name: "check bce", fn: checkbce},
 	{name: "dse", fn: dse},
+	{name: "memcombine", fn: memcombine},
 	{name: "writebarrier", fn: writebarrier, required: true}, // expand write barrier ops
 	{name: "insert resched checks", fn: insertLoopReschedChecks,
 		disabled: !buildcfg.Experiment.PreemptibleLoops}, // insert resched checks in loops.
 	{name: "lower", fn: lower, required: true},
 	{name: "addressing modes", fn: addressingModes, required: false},
+	{name: "late lower", fn: lateLower, required: true},
+	{name: "pair", fn: pair},
 	{name: "lowered deadcode for cse", fn: deadcode}, // deadcode immediately before CSE avoids CSE making dead values live again
 	{name: "lowered cse", fn: cse},
 	{name: "elim unread autos", fn: elimUnreadAutos},
 	{name: "tighten tuple selectors", fn: tightenTupleSelectors, required: true},
 	{name: "lowered deadcode", fn: deadcode, required: true},
 	{name: "checkLower", fn: checkLower, required: true},
-	{name: "late phielim", fn: phielim},
-	{name: "late copyelim", fn: copyelim},
-	{name: "tighten", fn: tighten}, // move values closer to their uses
+	{name: "late phielim and copyelim", fn: copyelim},
+	{name: "tighten", fn: tighten, required: true}, // move values closer to their uses
 	{name: "late deadcode", fn: deadcode},
 	{name: "critical", fn: critical, required: true}, // remove critical edges
 	{name: "phi tighten", fn: phiTighten},            // place rematerializable phi args near uses to reduce value lifetimes
@@ -507,7 +507,6 @@ var passes = [...]pass{
 	{name: "flagalloc", fn: flagalloc, required: true}, // allocate flags register
 	{name: "regalloc", fn: regalloc, required: true},   // allocate int & float registers + stack slots
 	{name: "loop rotate", fn: loopRotate},
-	{name: "stackframe", fn: stackframe, required: true},
 	{name: "trim", fn: trim}, // remove empty blocks
 }
 
@@ -546,6 +545,8 @@ var passOrder = [...]constraint{
 	{"generic cse", "tighten"},
 	// checkbce needs the values removed
 	{"generic deadcode", "check bce"},
+	// decompose builtin now also cleans up after expand calls
+	{"expand calls", "decompose builtin"},
 	// don't run optimization pass until we've decomposed builtin objects
 	{"decompose builtin", "late opt"},
 	// decompose builtin is the last pass that may introduce new float ops, so run softfloat after it
@@ -560,9 +561,14 @@ var passOrder = [...]constraint{
 	{"critical", "regalloc"},
 	// regalloc requires all the values in a block to be scheduled
 	{"schedule", "regalloc"},
+	// the rules in late lower run after the general rules.
+	{"lower", "late lower"},
+	// late lower may generate some values that need to be CSEed.
+	{"late lower", "lowered cse"},
 	// checkLower must run after lowering & subsequent dead code elim
 	{"lower", "checkLower"},
 	{"lowered deadcode", "checkLower"},
+	{"late lower", "checkLower"},
 	// late nilcheck needs instructions to be scheduled.
 	{"schedule", "late nilcheck"},
 	// flagalloc needs instructions to be scheduled.
@@ -571,10 +577,12 @@ var passOrder = [...]constraint{
 	{"flagalloc", "regalloc"},
 	// loopRotate will confuse regalloc.
 	{"regalloc", "loop rotate"},
-	// stackframe needs to know about spilled registers.
-	{"regalloc", "stackframe"},
 	// trim needs regalloc to be done first.
 	{"regalloc", "trim"},
+	// memcombine works better if fuse happens first, to help merge stores.
+	{"late fuse", "memcombine"},
+	// memcombine is a arch-independent pass.
+	{"memcombine", "lower"},
 }
 
 func init() {

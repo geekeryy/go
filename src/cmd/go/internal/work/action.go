@@ -9,14 +9,16 @@ package work
 import (
 	"bufio"
 	"bytes"
+	"cmd/internal/cov/covcmd"
+	"cmd/internal/par"
 	"container/heap"
 	"context"
 	"debug/elf"
 	"encoding/json"
 	"fmt"
+	"internal/platform"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -25,58 +27,74 @@ import (
 	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
+	"cmd/go/internal/str"
 	"cmd/go/internal/trace"
 	"cmd/internal/buildid"
+	"cmd/internal/robustio"
 )
 
 // A Builder holds global state about a build.
 // It does not hold per-package state, because we
 // build packages in parallel, and the builder is shared.
 type Builder struct {
-	WorkDir     string               // the temporary work directory (ends in filepath.Separator)
-	actionCache map[cacheKey]*Action // a cache of already-constructed actions
-	mkdirCache  map[string]bool      // a cache of created directories
-	flagCache   map[[2]string]bool   // a cache of supported compiler flags
-	Print       func(args ...any) (int, error)
+	WorkDir            string                    // the temporary work directory (ends in filepath.Separator)
+	actionCache        map[cacheKey]*Action      // a cache of already-constructed actions
+	flagCache          map[[2]string]bool        // a cache of supported compiler flags
+	gccCompilerIDCache map[string]cache.ActionID // cache for gccCompilerID
 
 	IsCmdList           bool // running as part of go list; set p.Stale and additional fields below
 	NeedError           bool // list needs p.Error
 	NeedExport          bool // list needs p.Export
 	NeedCompiledGoFiles bool // list needs p.CompiledGoFiles
+	AllowErrors         bool // errors don't immediately exit the program
 
 	objdirSeq int // counter for NewObjdir
 	pkgSeq    int
 
-	output    sync.Mutex
-	scriptDir string // current directory in printed script
+	backgroundSh *Shell // Shell that per-Action Shells are derived from
 
 	exec      sync.Mutex
 	readySema chan bool
 	ready     actionQueue
 
-	id           sync.Mutex
-	toolIDCache  map[string]string // tool name -> tool ID
-	buildIDCache map[string]string // file name -> build ID
+	id             sync.Mutex
+	toolIDCache    par.Cache[string, string] // tool name -> tool ID
+	gccToolIDCache map[string]string         // tool name -> tool ID
+	buildIDCache   map[string]string         // file name -> build ID
 }
 
 // NOTE: Much of Action would not need to be exported if not for test.
 // Maybe test functionality should move into this package too?
 
+// An Actor runs an action.
+type Actor interface {
+	Act(*Builder, context.Context, *Action) error
+}
+
+// An ActorFunc is an Actor that calls the function.
+type ActorFunc func(*Builder, context.Context, *Action) error
+
+func (f ActorFunc) Act(b *Builder, ctx context.Context, a *Action) error {
+	return f(b, ctx, a)
+}
+
 // An Action represents a single action in the action graph.
 type Action struct {
-	Mode       string                                         // description of action operation
-	Package    *load.Package                                  // the package this action works on
-	Deps       []*Action                                      // actions that must happen before this one
-	Func       func(*Builder, context.Context, *Action) error // the action itself (nil = no-op)
-	IgnoreFail bool                                           // whether to run f even if dependencies fail
-	TestOutput *bytes.Buffer                                  // test output buffer
-	Args       []string                                       // additional args for runProgram
+	Mode       string        // description of action operation
+	Package    *load.Package // the package this action works on
+	Deps       []*Action     // actions that must happen before this one
+	Actor      Actor         // the action itself (nil = no-op)
+	IgnoreFail bool          // whether to run f even if dependencies fail
+	TestOutput *bytes.Buffer // test output buffer
+	Args       []string      // additional args for runProgram
 
 	triggers []*Action // inverse of deps
 
 	buggyInstall bool // is this a buggy install (see -linkshared)?
 
 	TryCache func(*Builder, *Action) bool // callback for cache bypass
+
+	CacheExecutable bool // Whether to cache executables produced by link steps
 
 	// Generated files, directories.
 	Objdir   string         // directory for intermediate objects
@@ -91,10 +109,12 @@ type Action struct {
 	vetCfg    *vetConfig // vet config
 	output    []byte     // output redirect buffer (nil means use b.Print)
 
+	sh *Shell // lazily created per-Action shell; see Builder.Shell
+
 	// Execution state.
 	pending      int               // number of deps yet to complete
 	priority     int               // relative execution priority
-	Failed       bool              // whether the action failed
+	Failed       *Action           // set to root cause if the action failed
 	json         *actionJSON       // action graph information
 	nonGoOverlay map[string]string // map from non-.go source files to copied files in objdir. Nil if no overlay is used.
 	traceSpan    *trace.Span
@@ -192,7 +212,7 @@ func actionGraphJSON(a *Action) string {
 		}
 	}
 
-	var list []*actionJSON
+	list := make([]*actionJSON, 0, len(workq))
 	for id, a := range workq {
 		if a.json == nil {
 			a.json = &actionJSON{
@@ -202,7 +222,7 @@ func actionGraphJSON(a *Action) string {
 				Args:       a.Args,
 				Objdir:     a.Objdir,
 				Target:     a.Target,
-				Failed:     a.Failed,
+				Failed:     a.Failed != nil,
 				Priority:   a.priority,
 				Built:      a.built,
 				VetxOnly:   a.VetxOnly,
@@ -240,18 +260,28 @@ const (
 	ModeVetOnly = 1 << 8
 )
 
-func (b *Builder) Init() {
-	b.Print = func(a ...any) (int, error) {
-		return fmt.Fprint(os.Stderr, a...)
-	}
+// NewBuilder returns a new Builder ready for use.
+//
+// If workDir is the empty string, NewBuilder creates a WorkDir if needed
+// and arranges for it to be removed in case of an unclean exit.
+// The caller must Close the builder explicitly to clean up the WorkDir
+// before a clean exit.
+func NewBuilder(workDir string) *Builder {
+	b := new(Builder)
+
 	b.actionCache = make(map[cacheKey]*Action)
-	b.mkdirCache = make(map[string]bool)
-	b.toolIDCache = make(map[string]string)
+	b.gccToolIDCache = make(map[string]string)
 	b.buildIDCache = make(map[string]string)
 
-	if cfg.BuildN {
+	printWorkDir := false
+	if workDir != "" {
+		b.WorkDir = workDir
+	} else if cfg.BuildN {
 		b.WorkDir = "$WORK"
 	} else {
+		if !buildInitStarted {
+			panic("internal error: NewBuilder called before BuildInit")
+		}
 		tmp, err := os.MkdirTemp(cfg.Getenv("GOTMPDIR"), "go-build")
 		if err != nil {
 			base.Fatalf("go: creating work dir: %v", err)
@@ -265,32 +295,14 @@ func (b *Builder) Init() {
 			tmp = abs
 		}
 		b.WorkDir = tmp
-		if cfg.BuildX || cfg.BuildWork {
-			fmt.Fprintf(os.Stderr, "WORK=%s\n", b.WorkDir)
-		}
-		if !cfg.BuildWork {
-			workdir := b.WorkDir
-			base.AtExit(func() {
-				start := time.Now()
-				for {
-					err := os.RemoveAll(workdir)
-					if err == nil {
-						return
-					}
+		builderWorkDirs.Store(b, b.WorkDir)
+		printWorkDir = cfg.BuildX || cfg.BuildWork
+	}
 
-					// On some configurations of Windows, directories containing executable
-					// files may be locked for a while after the executable exits (perhaps
-					// due to antivirus scans?). It's probably worth a little extra latency
-					// on exit to avoid filling up the user's temporary directory with leaked
-					// files. (See golang.org/issue/30789.)
-					if runtime.GOOS != "windows" || time.Since(start) >= 500*time.Millisecond {
-						fmt.Fprintf(os.Stderr, "go: failed to remove work dir: %s\n", err)
-						return
-					}
-					time.Sleep(5 * time.Millisecond)
-				}
-			})
-		}
+	b.backgroundSh = NewShell(b.WorkDir, nil)
+
+	if printWorkDir {
+		b.BackgroundShell().Printf("WORK=%s\n", b.WorkDir)
 	}
 
 	if err := CheckGOOSARCHPair(cfg.Goos, cfg.Goarch); err != nil {
@@ -306,10 +318,50 @@ func (b *Builder) Init() {
 			base.Exit()
 		}
 	}
+
+	return b
+}
+
+var builderWorkDirs sync.Map // *Builder → WorkDir
+
+func (b *Builder) Close() error {
+	wd, ok := builderWorkDirs.Load(b)
+	if !ok {
+		return nil
+	}
+	defer builderWorkDirs.Delete(b)
+
+	if b.WorkDir != wd.(string) {
+		base.Errorf("go: internal error: Builder WorkDir unexpectedly changed from %s to %s", wd, b.WorkDir)
+	}
+
+	if !cfg.BuildWork {
+		if err := robustio.RemoveAll(b.WorkDir); err != nil {
+			return err
+		}
+	}
+	b.WorkDir = ""
+	return nil
+}
+
+func closeBuilders() {
+	leakedBuilders := 0
+	builderWorkDirs.Range(func(bi, _ any) bool {
+		leakedBuilders++
+		if err := bi.(*Builder).Close(); err != nil {
+			base.Error(err)
+		}
+		return true
+	})
+
+	if leakedBuilders > 0 && base.GetExitStatus() == 0 {
+		fmt.Fprintf(os.Stderr, "go: internal error: Builder leaked on successful exit\n")
+		base.SetExitStatus(1)
+	}
 }
 
 func CheckGOOSARCHPair(goos, goarch string) error {
-	if _, ok := cfg.OSArchSupportsCgo[goos+"/"+goarch]; !ok && cfg.BuildContext.Compiler == "gc" {
+	if !platform.BuildModeSupported(cfg.BuildContext.Compiler, "default", goos, goarch) {
 		return fmt.Errorf("unsupported GOOS/GOARCH pair %s/%s", goos, goarch)
 	}
 	return nil
@@ -325,7 +377,7 @@ func CheckGOOSARCHPair(goos, goarch string) error {
 // be called during action graph execution.
 func (b *Builder) NewObjdir() string {
 	b.objdirSeq++
-	return filepath.Join(b.WorkDir, fmt.Sprintf("b%03d", b.objdirSeq)) + string(filepath.Separator)
+	return str.WithFilePathSeparator(filepath.Join(b.WorkDir, fmt.Sprintf("b%03d", b.objdirSeq)))
 }
 
 // readpkglist returns the list of packages that were built into the shared library
@@ -335,16 +387,24 @@ func (b *Builder) NewObjdir() string {
 func readpkglist(shlibpath string) (pkgs []*load.Package) {
 	var stk load.ImportStack
 	if cfg.BuildToolchainName == "gccgo" {
-		f, _ := elf.Open(shlibpath)
+		f, err := elf.Open(shlibpath)
+		if err != nil {
+			base.Fatal(fmt.Errorf("failed to open shared library: %v", err))
+		}
+		defer f.Close()
 		sect := f.Section(".go_export")
-		data, _ := sect.Data()
-		scanner := bufio.NewScanner(bytes.NewBuffer(data))
-		for scanner.Scan() {
-			t := scanner.Text()
-			if strings.HasPrefix(t, "pkgpath ") {
-				t = strings.TrimPrefix(t, "pkgpath ")
-				t = strings.TrimSuffix(t, ";")
-				pkgs = append(pkgs, load.LoadImportWithFlags(t, base.Cwd(), nil, &stk, nil, 0))
+		if sect == nil {
+			base.Fatal(fmt.Errorf("%s: missing .go_export section", shlibpath))
+		}
+		data, err := sect.Data()
+		if err != nil {
+			base.Fatal(fmt.Errorf("%s: failed to read .go_export section: %v", shlibpath, err))
+		}
+		pkgpath := []byte("pkgpath ")
+		for _, line := range bytes.Split(data, []byte{'\n'}) {
+			if path, found := bytes.CutPrefix(line, pkgpath); found {
+				path = bytes.TrimSuffix(path, []byte{';'})
+				pkgs = append(pkgs, load.LoadPackageWithFlags(string(path), base.Cwd(), &stk, nil, 0))
 			}
 		}
 	} else {
@@ -355,7 +415,7 @@ func readpkglist(shlibpath string) (pkgs []*load.Package) {
 		scanner := bufio.NewScanner(bytes.NewBuffer(pkglistbytes))
 		for scanner.Scan() {
 			t := scanner.Text()
-			pkgs = append(pkgs, load.LoadImportWithFlags(t, base.Cwd(), nil, &stk, nil, 0))
+			pkgs = append(pkgs, load.LoadPackageWithFlags(t, base.Cwd(), &stk, nil, 0))
 		}
 	}
 	return
@@ -382,6 +442,95 @@ func (b *Builder) AutoAction(mode, depMode BuildMode, p *load.Package) *Action {
 	return b.CompileAction(mode, depMode, p)
 }
 
+// buildActor implements the Actor interface for package build
+// actions. For most package builds this simply means invoking th
+// *Builder.build method; in the case of "go test -cover" for
+// a package with no test files, we stores some additional state
+// information in the build actor to help with reporting.
+type buildActor struct {
+	// name of static meta-data file fragment emitted by the cover
+	// tool as part of the package build action, for selected
+	// "go test -cover" runs.
+	covMetaFileName string
+}
+
+// newBuildActor returns a new buildActor object, setting up the
+// covMetaFileName field if 'genCoverMeta' flag is set.
+func newBuildActor(p *load.Package, genCoverMeta bool) *buildActor {
+	ba := &buildActor{}
+	if genCoverMeta {
+		ba.covMetaFileName = covcmd.MetaFileForPackage(p.ImportPath)
+	}
+	return ba
+}
+
+func (ba *buildActor) Act(b *Builder, ctx context.Context, a *Action) error {
+	return b.build(ctx, a)
+}
+
+// pgoActionID computes the action ID for a preprocess PGO action.
+func (b *Builder) pgoActionID(input string) cache.ActionID {
+	h := cache.NewHash("preprocess PGO profile " + input)
+
+	fmt.Fprintf(h, "preprocess PGO profile\n")
+	fmt.Fprintf(h, "preprofile %s\n", b.toolID("preprofile"))
+	fmt.Fprintf(h, "input %q\n", b.fileHash(input))
+
+	return h.Sum()
+}
+
+// pgoActor implements the Actor interface for preprocessing PGO profiles.
+type pgoActor struct {
+	// input is the path to the original pprof profile.
+	input string
+}
+
+func (p *pgoActor) Act(b *Builder, ctx context.Context, a *Action) error {
+	if b.useCache(a, b.pgoActionID(p.input), a.Target, !b.IsCmdList) || b.IsCmdList {
+		return nil
+	}
+	defer b.flushOutput(a)
+
+	sh := b.Shell(a)
+
+	if err := sh.Mkdir(a.Objdir); err != nil {
+		return err
+	}
+
+	if err := sh.run(".", p.input, nil, cfg.BuildToolexec, base.Tool("preprofile"), "-o", a.Target, "-i", p.input); err != nil {
+		return err
+	}
+
+	// N.B. Builder.build looks for the out in a.built, regardless of
+	// whether this came from cache.
+	a.built = a.Target
+
+	if !cfg.BuildN {
+		// Cache the output.
+		//
+		// N.B. We don't use updateBuildID here, as preprocessed PGO profiles
+		// do not contain a build ID. updateBuildID is typically responsible
+		// for adding to the cache, thus we must do so ourselves instead.
+
+		r, err := os.Open(a.Target)
+		if err != nil {
+			return fmt.Errorf("error opening target for caching: %w", err)
+		}
+
+		c := cache.Default()
+		outputID, _, err := c.Put(a.actionID, r)
+		r.Close()
+		if err != nil {
+			return fmt.Errorf("error adding target to cache: %w", err)
+		}
+		if cfg.BuildX {
+			sh.ShowCmd("", "%s # internal", joinUnambiguously(str.StringList("cp", a.Target, c.OutputFile(outputID))))
+		}
+	}
+
+	return nil
+}
+
 // CompileAction returns the action for compiling and possibly installing
 // (according to mode) the given package. The resulting action is only
 // for building packages (archives), never for linking executables.
@@ -391,8 +540,8 @@ func (b *Builder) CompileAction(mode, depMode BuildMode, p *load.Package) *Actio
 	vetOnly := mode&ModeVetOnly != 0
 	mode &^= ModeVetOnly
 
-	if mode != ModeBuild && (p.Internal.Local || p.Module != nil) && p.Target == "" {
-		// Imported via local path or using modules. No permanent target.
+	if mode != ModeBuild && p.Target == "" {
+		// No permanent target.
 		mode = ModeBuild
 	}
 	if mode != ModeBuild && p.Name == "main" {
@@ -405,7 +554,7 @@ func (b *Builder) CompileAction(mode, depMode BuildMode, p *load.Package) *Actio
 		a := &Action{
 			Mode:    "build",
 			Package: p,
-			Func:    (*Builder).build,
+			Actor:   newBuildActor(p, p.Internal.Cover.GenMeta),
 			Objdir:  b.NewObjdir(),
 		}
 
@@ -415,12 +564,26 @@ func (b *Builder) CompileAction(mode, depMode BuildMode, p *load.Package) *Actio
 			}
 		}
 
+		if p.Internal.PGOProfile != "" {
+			pgoAction := b.cacheAction("preprocess PGO profile "+p.Internal.PGOProfile, nil, func() *Action {
+				a := &Action{
+					Mode:   "preprocess PGO profile",
+					Actor:  &pgoActor{input: p.Internal.PGOProfile},
+					Objdir: b.NewObjdir(),
+				}
+				a.Target = filepath.Join(a.Objdir, "pgo.preprofile")
+
+				return a
+			})
+			a.Deps = append(a.Deps, pgoAction)
+		}
+
 		if p.Standard {
 			switch p.ImportPath {
 			case "builtin", "unsafe":
 				// Fake packages - nothing to build.
 				a.Mode = "built-in package"
-				a.Func = nil
+				a.Actor = nil
 				return a
 			}
 
@@ -429,7 +592,7 @@ func (b *Builder) CompileAction(mode, depMode BuildMode, p *load.Package) *Actio
 				// the target name is needed for cgo.
 				a.Mode = "gccgo stdlib"
 				a.Target = p.Target
-				a.Func = nil
+				a.Actor = nil
 				return a
 			}
 		}
@@ -475,8 +638,11 @@ func (b *Builder) vetAction(mode, depMode BuildMode, p *load.Package) *Action {
 
 		// vet expects to be able to import "fmt".
 		var stk load.ImportStack
-		stk.Push("vet")
-		p1 := load.LoadImportWithFlags("fmt", p.Dir, p, &stk, nil, 0)
+		stk.Push(load.NewImportInfo("vet", nil))
+		p1, err := load.LoadImportWithFlags("fmt", p.Dir, p, &stk, nil, 0)
+		if err != nil {
+			base.Fatalf("unexpected error loading fmt package from package %s: %v", p.ImportPath, err)
+		}
 		stk.Pop()
 		aFmt := b.CompileAction(ModeBuild, depMode, p1)
 
@@ -502,12 +668,12 @@ func (b *Builder) vetAction(mode, depMode BuildMode, p *load.Package) *Action {
 			VetxOnly:   true,
 			IgnoreFail: true, // it's OK if vet of dependencies "fails" (reports problems)
 		}
-		if a1.Func == nil {
+		if a1.Actor == nil {
 			// Built-in packages like unsafe.
 			return a
 		}
 		deps[0].needVet = true
-		a.Func = (*Builder).vet
+		a.Actor = ActorFunc((*Builder).vet)
 		return a
 	})
 	return a
@@ -525,7 +691,7 @@ func (b *Builder) LinkAction(mode, depMode BuildMode, p *load.Package) *Action {
 		}
 
 		a1 := b.CompileAction(ModeBuild, depMode, p)
-		a.Func = (*Builder).link
+		a.Actor = ActorFunc((*Builder).link)
 		a.Deps = []*Action{a1}
 		a.Objdir = a1.Objdir
 
@@ -587,7 +753,7 @@ func (b *Builder) installAction(a1 *Action, mode BuildMode) *Action {
 	// If there's no actual action to build a1,
 	// there's nothing to install either.
 	// This happens if a1 corresponds to reusing an already-built object.
-	if a1.Func == nil {
+	if a1.Actor == nil {
 		return a1
 	}
 
@@ -613,7 +779,7 @@ func (b *Builder) installAction(a1 *Action, mode BuildMode) *Action {
 		// on the install.
 		*a1 = Action{
 			Mode:    buildAction.Mode + "-install",
-			Func:    BuildInstallFunc,
+			Actor:   ActorFunc(BuildInstallFunc),
 			Package: p,
 			Objdir:  buildAction.Objdir,
 			Deps:    []*Action{buildAction},
@@ -704,7 +870,7 @@ func (b *Builder) addInstallHeaderAction(a *Action) {
 			Mode:    "install header",
 			Package: a.Package,
 			Deps:    []*Action{a.Deps[0]},
-			Func:    (*Builder).installHeader,
+			Actor:   ActorFunc((*Builder).installHeader),
 			Objdir:  a.Deps[0].Objdir,
 			Target:  hdrTarget,
 		}
@@ -764,7 +930,7 @@ func (b *Builder) linkSharedAction(mode, depMode BuildMode, shlib string, a1 *Ac
 			Mode:    "go build -buildmode=shared",
 			Package: p,
 			Objdir:  b.NewObjdir(),
-			Func:    (*Builder).linkShared,
+			Actor:   ActorFunc((*Builder).linkShared),
 			Deps:    []*Action{a1},
 		}
 		a.Target = filepath.Join(a.Objdir, shlib)
@@ -776,7 +942,7 @@ func (b *Builder) linkSharedAction(mode, depMode BuildMode, shlib string, a1 *Ac
 					}
 				}
 				var stk load.ImportStack
-				p := load.LoadImportWithFlags(pkg, base.Cwd(), nil, &stk, nil, 0)
+				p := load.LoadPackageWithFlags(pkg, base.Cwd(), &stk, nil, 0)
 				if p.Error != nil {
 					base.Fatalf("load %s: %v", pkg, p.Error)
 				}
@@ -796,7 +962,11 @@ func (b *Builder) linkSharedAction(mode, depMode BuildMode, shlib string, a1 *Ac
 
 			// The linker step still needs all the usual linker deps.
 			// (For example, the linker always opens runtime.a.)
-			for _, dep := range load.LinkerDeps(nil) {
+			ldDeps, err := load.LinkerDeps(nil)
+			if err != nil {
+				base.Error(err)
+			}
+			for _, dep := range ldDeps {
 				add(a, dep, true)
 			}
 		}
@@ -805,7 +975,7 @@ func (b *Builder) linkSharedAction(mode, depMode BuildMode, shlib string, a1 *Ac
 	})
 
 	// Install result.
-	if (mode == ModeInstall || mode == ModeBuggyInstall) && a.Func != nil {
+	if (mode == ModeInstall || mode == ModeBuggyInstall) && a.Actor != nil {
 		buildAction := a
 
 		a = b.cacheAction("install-shlib "+shlib, nil, func() *Action {
@@ -834,20 +1004,21 @@ func (b *Builder) linkSharedAction(mode, depMode BuildMode, shlib string, a1 *Ac
 			a := &Action{
 				Mode:   "go install -buildmode=shared",
 				Objdir: buildAction.Objdir,
-				Func:   BuildInstallFunc,
+				Actor:  ActorFunc(BuildInstallFunc),
 				Deps:   []*Action{buildAction},
 				Target: target,
 			}
 			for _, a2 := range buildAction.Deps[0].Deps {
 				p := a2.Package
-				if p.Target == "" {
+				pkgTargetRoot := p.Internal.Build.PkgTargetRoot
+				if pkgTargetRoot == "" {
 					continue
 				}
 				a.Deps = append(a.Deps, &Action{
 					Mode:    "shlibname",
 					Package: p,
-					Func:    (*Builder).installShlibname,
-					Target:  strings.TrimSuffix(p.Target, ".a") + ".shlibname",
+					Actor:   ActorFunc((*Builder).installShlibname),
+					Target:  filepath.Join(pkgTargetRoot, p.ImportPath+".shlibname"),
 					Deps:    []*Action{a.Deps[0]},
 				})
 			}

@@ -7,11 +7,13 @@
 package syscall
 
 import (
+	errorspkg "errors"
+	"internal/asan"
 	"internal/bytealg"
 	"internal/itoa"
+	"internal/msan"
 	"internal/oserror"
 	"internal/race"
-	"internal/unsafeheader"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -57,11 +59,7 @@ func (m *mmapper) Mmap(fd int, offset int64, length int, prot int, flags int) (d
 	}
 
 	// Use unsafe to turn addr into a []byte.
-	var b []byte
-	hdr := (*unsafeheader.Slice)(unsafe.Pointer(&b))
-	hdr.Data = unsafe.Pointer(addr)
-	hdr.Cap = length
-	hdr.Len = length
+	b := unsafe.Slice((*byte)(unsafe.Pointer(addr)), length)
 
 	// Register mapping in m and return it.
 	p := &b[cap(b)-1]
@@ -102,8 +100,8 @@ func (m *mmapper) Munmap(data []byte) (err error) {
 //		err = errno
 //	}
 //
-// Errno values can be tested against error values from the os package
-// using errors.Is. For example:
+// Errno values can be tested against error values using [errors.Is].
+// For example:
 //
 //	_, _, err := syscall.Syscall(...)
 //	if errors.Is(err, fs.ErrNotExist) ...
@@ -127,6 +125,8 @@ func (e Errno) Is(target error) bool {
 		return e == EEXIST || e == ENOTEMPTY
 	case oserror.ErrNotExist:
 		return e == ENOENT
+	case errorspkg.ErrUnsupported:
+		return e == ENOSYS || e == ENOTSUP || e == EOPNOTSUPP
 	}
 	return false
 }
@@ -164,7 +164,7 @@ func errnoErr(e Errno) error {
 }
 
 // A Signal is a number describing a process signal.
-// It implements the os.Signal interface.
+// It implements the [os.Signal] interface.
 type Signal int
 
 func (s Signal) Signal() {}
@@ -189,11 +189,11 @@ func Read(fd int, p []byte) (n int, err error) {
 			race.Acquire(unsafe.Pointer(&ioSync))
 		}
 	}
-	if msanenabled && n > 0 {
-		msanWrite(unsafe.Pointer(&p[0]), n)
+	if msan.Enabled && n > 0 {
+		msan.Write(unsafe.Pointer(&p[0]), uintptr(n))
 	}
-	if asanenabled && n > 0 {
-		asanWrite(unsafe.Pointer(&p[0]), n)
+	if asan.Enabled && n > 0 {
+		asan.Write(unsafe.Pointer(&p[0]), uintptr(n))
 	}
 	return
 }
@@ -213,11 +213,11 @@ func Write(fd int, p []byte) (n int, err error) {
 	if race.Enabled && n > 0 {
 		race.ReadRange(unsafe.Pointer(&p[0]), n)
 	}
-	if msanenabled && n > 0 {
-		msanRead(unsafe.Pointer(&p[0]), n)
+	if msan.Enabled && n > 0 {
+		msan.Read(unsafe.Pointer(&p[0]), uintptr(n))
 	}
-	if asanenabled && n > 0 {
-		asanRead(unsafe.Pointer(&p[0]), n)
+	if asan.Enabled && n > 0 {
+		asan.Read(unsafe.Pointer(&p[0]), uintptr(n))
 	}
 	return
 }
@@ -232,11 +232,11 @@ func Pread(fd int, p []byte, offset int64) (n int, err error) {
 			race.Acquire(unsafe.Pointer(&ioSync))
 		}
 	}
-	if msanenabled && n > 0 {
-		msanWrite(unsafe.Pointer(&p[0]), n)
+	if msan.Enabled && n > 0 {
+		msan.Write(unsafe.Pointer(&p[0]), uintptr(n))
 	}
-	if asanenabled && n > 0 {
-		asanWrite(unsafe.Pointer(&p[0]), n)
+	if asan.Enabled && n > 0 {
+		asan.Write(unsafe.Pointer(&p[0]), uintptr(n))
 	}
 	return
 }
@@ -249,17 +249,17 @@ func Pwrite(fd int, p []byte, offset int64) (n int, err error) {
 	if race.Enabled && n > 0 {
 		race.ReadRange(unsafe.Pointer(&p[0]), n)
 	}
-	if msanenabled && n > 0 {
-		msanRead(unsafe.Pointer(&p[0]), n)
+	if msan.Enabled && n > 0 {
+		msan.Read(unsafe.Pointer(&p[0]), uintptr(n))
 	}
-	if asanenabled && n > 0 {
-		asanRead(unsafe.Pointer(&p[0]), n)
+	if asan.Enabled && n > 0 {
+		asan.Read(unsafe.Pointer(&p[0]), uintptr(n))
 	}
 	return
 }
 
 // For testing: clients can set this flag to force
-// creation of IPv6 sockets to return EAFNOSUPPORT.
+// creation of IPv6 sockets to return [EAFNOSUPPORT].
 var SocketDisableIPv6 bool
 
 type Sockaddr interface {
@@ -442,11 +442,17 @@ func sendtoInet6(fd int, p []byte, flags int, to *SockaddrInet6) (err error) {
 }
 
 func Sendto(fd int, p []byte, flags int, to Sockaddr) (err error) {
-	ptr, n, err := to.sockaddr()
-	if err != nil {
-		return err
+	var (
+		ptr   unsafe.Pointer
+		salen _Socklen
+	)
+	if to != nil {
+		ptr, salen, err = to.sockaddr()
+		if err != nil {
+			return err
+		}
 	}
-	return sendto(fd, p, flags, ptr, n)
+	return sendto(fd, p, flags, ptr, salen)
 }
 
 func SetsockoptByte(fd, level, opt int, value byte) (err error) {

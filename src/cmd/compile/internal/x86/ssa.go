@@ -18,7 +18,7 @@ import (
 	"cmd/internal/obj/x86"
 )
 
-// markMoves marks any MOVXconst ops that need to avoid clobbering flags.
+// ssaMarkMoves marks any MOVXconst ops that need to avoid clobbering flags.
 func ssaMarkMoves(s *ssagen.State, b *ssa.Block) {
 	flive := b.FlagsLiveAtEnd
 	for _, c := range b.ControlValues() {
@@ -28,7 +28,7 @@ func ssaMarkMoves(s *ssagen.State, b *ssa.Block) {
 		v := b.Values[i]
 		if flive && v.Op == ssa.Op386MOVLconst {
 			// The "mark" is any non-nil Aux value.
-			v.Aux = v
+			v.Aux = ssa.AuxMark
 		}
 		if v.Type.IsFlags() {
 			flive = false
@@ -158,6 +158,7 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		ssa.Op386SHLL,
 		ssa.Op386SHRL, ssa.Op386SHRW, ssa.Op386SHRB,
 		ssa.Op386SARL, ssa.Op386SARW, ssa.Op386SARB,
+		ssa.Op386ROLL, ssa.Op386ROLW, ssa.Op386ROLB,
 		ssa.Op386ADDSS, ssa.Op386ADDSD, ssa.Op386SUBSS, ssa.Op386SUBSD,
 		ssa.Op386MULSS, ssa.Op386MULSD, ssa.Op386DIVSS, ssa.Op386DIVSD,
 		ssa.Op386PXOR,
@@ -344,7 +345,7 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		p.From.Offset = v.AuxInt
 		p.To.Type = obj.TYPE_REG
 		p.To.Reg = r
-		p.SetFrom3Reg(v.Args[0].Reg())
+		p.AddRestSourceReg(v.Args[0].Reg())
 
 	case ssa.Op386SUBLconst,
 		ssa.Op386ADCLconst,
@@ -736,7 +737,8 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		p := s.Prog(obj.ACALL)
 		p.To.Type = obj.TYPE_MEM
 		p.To.Name = obj.NAME_EXTERN
-		p.To.Sym = v.Aux.(*obj.LSym)
+		// AuxInt encodes how many buffer entries we need.
+		p.To.Sym = ir.Syms.GCWriteBarrier[v.AuxInt-1]
 
 	case ssa.Op386LoweredPanicBoundsA, ssa.Op386LoweredPanicBoundsB, ssa.Op386LoweredPanicBoundsC:
 		p := s.Prog(obj.ACALL)
@@ -829,6 +831,77 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		if base.Debug.Nil != 0 && v.Pos.Line() > 1 { // v.Pos.Line()==1 in generated wrappers
 			base.WarnfAt(v.Pos, "generated nil check")
 		}
+	case ssa.Op386LoweredCtz32:
+		// BSFL in, out
+		p := s.Prog(x86.ABSFL)
+		p.From.Type = obj.TYPE_REG
+		p.From.Reg = v.Args[0].Reg()
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = v.Reg()
+
+		// JNZ 2(PC)
+		p1 := s.Prog(x86.AJNE)
+		p1.To.Type = obj.TYPE_BRANCH
+
+		// MOVL $32, out
+		p2 := s.Prog(x86.AMOVL)
+		p2.From.Type = obj.TYPE_CONST
+		p2.From.Offset = 32
+		p2.To.Type = obj.TYPE_REG
+		p2.To.Reg = v.Reg()
+
+		// NOP (so the JNZ has somewhere to land)
+		nop := s.Prog(obj.ANOP)
+		p1.To.SetTarget(nop)
+	case ssa.Op386LoweredCtz64:
+		if v.Args[0].Reg() == v.Reg() {
+			v.Fatalf("input[0] and output in the same register %s", v.LongString())
+		}
+		if v.Args[1].Reg() == v.Reg() {
+			v.Fatalf("input[1] and output in the same register %s", v.LongString())
+		}
+
+		// BSFL arg0, out
+		p := s.Prog(x86.ABSFL)
+		p.From.Type = obj.TYPE_REG
+		p.From.Reg = v.Args[0].Reg()
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = v.Reg()
+
+		// JNZ 5(PC)
+		p1 := s.Prog(x86.AJNE)
+		p1.To.Type = obj.TYPE_BRANCH
+
+		// BSFL arg1, out
+		p2 := s.Prog(x86.ABSFL)
+		p2.From.Type = obj.TYPE_REG
+		p2.From.Reg = v.Args[1].Reg()
+		p2.To.Type = obj.TYPE_REG
+		p2.To.Reg = v.Reg()
+
+		// JNZ 2(PC)
+		p3 := s.Prog(x86.AJNE)
+		p3.To.Type = obj.TYPE_BRANCH
+
+		// MOVL $32, out
+		p4 := s.Prog(x86.AMOVL)
+		p4.From.Type = obj.TYPE_CONST
+		p4.From.Offset = 32
+		p4.To.Type = obj.TYPE_REG
+		p4.To.Reg = v.Reg()
+
+		// ADDL $32, out
+		p5 := s.Prog(x86.AADDL)
+		p5.From.Type = obj.TYPE_CONST
+		p5.From.Offset = 32
+		p5.To.Type = obj.TYPE_REG
+		p5.To.Reg = v.Reg()
+		p3.To.SetTarget(p5)
+
+		// NOP (so the JNZ has somewhere to land)
+		nop := s.Prog(obj.ANOP)
+		p1.To.SetTarget(nop)
+
 	case ssa.OpClobber:
 		p := s.Prog(x86.AMOVL)
 		p.From.Type = obj.TYPE_CONST
@@ -873,24 +946,7 @@ var nefJumps = [2][2]ssagen.IndexJump{
 
 func ssaGenBlock(s *ssagen.State, b, next *ssa.Block) {
 	switch b.Kind {
-	case ssa.BlockPlain:
-		if b.Succs[0].Block() != next {
-			p := s.Prog(obj.AJMP)
-			p.To.Type = obj.TYPE_BRANCH
-			s.Branches = append(s.Branches, ssagen.Branch{P: p, B: b.Succs[0].Block()})
-		}
-	case ssa.BlockDefer:
-		// defer returns in rax:
-		// 0 if we should continue executing
-		// 1 if we should jump to deferreturn call
-		p := s.Prog(x86.ATESTL)
-		p.From.Type = obj.TYPE_REG
-		p.From.Reg = x86.REG_AX
-		p.To.Type = obj.TYPE_REG
-		p.To.Reg = x86.REG_AX
-		p = s.Prog(x86.AJNE)
-		p.To.Type = obj.TYPE_BRANCH
-		s.Branches = append(s.Branches, ssagen.Branch{P: p, B: b.Succs[1].Block()})
+	case ssa.BlockPlain, ssa.BlockDefer:
 		if b.Succs[0].Block() != next {
 			p := s.Prog(obj.AJMP)
 			p.To.Type = obj.TYPE_BRANCH

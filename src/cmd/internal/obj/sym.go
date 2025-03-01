@@ -33,9 +33,10 @@ package obj
 
 import (
 	"cmd/internal/goobj"
-	"cmd/internal/notsha256"
+	"cmd/internal/hash"
 	"cmd/internal/objabi"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"internal/buildcfg"
 	"log"
@@ -85,7 +86,7 @@ func (ctxt *Link) LookupABI(name string, abi ABI) *LSym {
 	return ctxt.LookupABIInit(name, abi, nil)
 }
 
-// LookupABI looks up a symbol with the given ABI.
+// LookupABIInit looks up a symbol with the given ABI.
 // If it does not exist, it creates it and
 // passes it to init for one-time initialization.
 func (ctxt *Link) LookupABIInit(name string, abi ABI, init func(s *LSym)) *LSym {
@@ -136,13 +137,18 @@ func (ctxt *Link) LookupInit(name string, init func(s *LSym)) *LSym {
 	return s
 }
 
+func (ctxt *Link) rodataKind() (suffix string, typ objabi.SymKind) {
+	return "", objabi.SRODATA
+}
+
 func (ctxt *Link) Float32Sym(f float32) *LSym {
+	suffix, typ := ctxt.rodataKind()
 	i := math.Float32bits(f)
-	name := fmt.Sprintf("$f32.%08x", i)
+	name := fmt.Sprintf("$f32.%08x%s", i, suffix)
 	return ctxt.LookupInit(name, func(s *LSym) {
 		s.Size = 4
 		s.WriteFloat32(ctxt, 0, f)
-		s.Type = objabi.SRODATA
+		s.Type = typ
 		s.Set(AttrLocal, true)
 		s.Set(AttrContentAddressable, true)
 		ctxt.constSyms = append(ctxt.constSyms, s)
@@ -150,12 +156,26 @@ func (ctxt *Link) Float32Sym(f float32) *LSym {
 }
 
 func (ctxt *Link) Float64Sym(f float64) *LSym {
+	suffix, typ := ctxt.rodataKind()
 	i := math.Float64bits(f)
-	name := fmt.Sprintf("$f64.%016x", i)
+	name := fmt.Sprintf("$f64.%016x%s", i, suffix)
 	return ctxt.LookupInit(name, func(s *LSym) {
 		s.Size = 8
 		s.WriteFloat64(ctxt, 0, f)
-		s.Type = objabi.SRODATA
+		s.Type = typ
+		s.Set(AttrLocal, true)
+		s.Set(AttrContentAddressable, true)
+		ctxt.constSyms = append(ctxt.constSyms, s)
+	})
+}
+
+func (ctxt *Link) Int32Sym(i int64) *LSym {
+	suffix, typ := ctxt.rodataKind()
+	name := fmt.Sprintf("$i32.%08x%s", uint64(i), suffix)
+	return ctxt.LookupInit(name, func(s *LSym) {
+		s.Size = 4
+		s.WriteInt(ctxt, 0, 4, i)
+		s.Type = typ
 		s.Set(AttrLocal, true)
 		s.Set(AttrContentAddressable, true)
 		ctxt.constSyms = append(ctxt.constSyms, s)
@@ -163,11 +183,31 @@ func (ctxt *Link) Float64Sym(f float64) *LSym {
 }
 
 func (ctxt *Link) Int64Sym(i int64) *LSym {
-	name := fmt.Sprintf("$i64.%016x", uint64(i))
+	suffix, typ := ctxt.rodataKind()
+	name := fmt.Sprintf("$i64.%016x%s", uint64(i), suffix)
 	return ctxt.LookupInit(name, func(s *LSym) {
 		s.Size = 8
 		s.WriteInt(ctxt, 0, 8, i)
-		s.Type = objabi.SRODATA
+		s.Type = typ
+		s.Set(AttrLocal, true)
+		s.Set(AttrContentAddressable, true)
+		ctxt.constSyms = append(ctxt.constSyms, s)
+	})
+}
+
+func (ctxt *Link) Int128Sym(hi, lo int64) *LSym {
+	suffix, typ := ctxt.rodataKind()
+	name := fmt.Sprintf("$i128.%016x%016x%s", uint64(hi), uint64(lo), suffix)
+	return ctxt.LookupInit(name, func(s *LSym) {
+		s.Size = 16
+		if ctxt.Arch.ByteOrder == binary.LittleEndian {
+			s.WriteInt(ctxt, 0, 8, lo)
+			s.WriteInt(ctxt, 8, 8, hi)
+		} else {
+			s.WriteInt(ctxt, 0, 8, hi)
+			s.WriteInt(ctxt, 8, 8, lo)
+		}
+		s.Type = typ
 		s.Set(AttrLocal, true)
 		s.Set(AttrContentAddressable, true)
 		ctxt.constSyms = append(ctxt.constSyms, s)
@@ -176,7 +216,7 @@ func (ctxt *Link) Int64Sym(i int64) *LSym {
 
 // GCLocalsSym generates a content-addressable sym containing data.
 func (ctxt *Link) GCLocalsSym(data []byte) *LSym {
-	sum := notsha256.Sum256(data)
+	sum := hash.Sum32(data)
 	str := base64.StdEncoding.EncodeToString(sum[:16])
 	return ctxt.LookupInit(fmt.Sprintf("gclocals·%s", str), func(lsym *LSym) {
 		lsym.P = data
@@ -188,12 +228,20 @@ func (ctxt *Link) GCLocalsSym(data []byte) *LSym {
 // asm is set to true if this is called by the assembler (i.e. not the compiler),
 // in which case all the symbols are non-package (for now).
 func (ctxt *Link) NumberSyms() {
+	if ctxt.Pkgpath == "" {
+		panic("NumberSyms called without package path")
+	}
+
 	if ctxt.Headtype == objabi.Haix {
-		// Data must be sorted to keep a constant order in TOC symbols.
-		// As they are created during Progedit, two symbols can be switched between
-		// two different compilations. Therefore, BuildID will be different.
-		// TODO: find a better place and optimize to only sort TOC symbols
-		sort.Slice(ctxt.Data, func(i, j int) bool {
+		// Data must be in a reliable order for reproducible builds.
+		// The original entries are in a reliable order, but the TOC symbols
+		// that are added in Progedit are added by different goroutines
+		// that can be scheduled independently. We need to reorder those
+		// symbols reliably. Sort by name but use a stable sort, so that
+		// any original entries with the same name (all DWARFVAR symbols
+		// have empty names but different relocation sets) are not shuffled.
+		// TODO: Find a better place and optimize to only sort TOC symbols.
+		sort.SliceStable(ctxt.Data, func(i, j int) bool {
 			return ctxt.Data[i].Name < ctxt.Data[j].Name
 		})
 	}
@@ -206,6 +254,13 @@ func (ctxt *Link) NumberSyms() {
 	ctxt.Data = append(ctxt.Data, ctxt.constSyms...)
 	ctxt.constSyms = nil
 
+	// So are SEH symbols.
+	sort.Slice(ctxt.SEHSyms, func(i, j int) bool {
+		return ctxt.SEHSyms[i].Name < ctxt.SEHSyms[j].Name
+	})
+	ctxt.Data = append(ctxt.Data, ctxt.SEHSyms...)
+	ctxt.SEHSyms = nil
+
 	ctxt.pkgIdx = make(map[string]int32)
 	ctxt.defs = []*LSym{}
 	ctxt.hashed64defs = []*LSym{}
@@ -214,9 +269,7 @@ func (ctxt *Link) NumberSyms() {
 
 	var idx, hashedidx, hashed64idx, nonpkgidx int32
 	ctxt.traverseSyms(traverseDefs|traversePcdata, func(s *LSym) {
-		// if Pkgpath is unknown, cannot hash symbols with relocations, as it
-		// may reference named symbols whose names are not fully expanded.
-		if s.ContentAddressable() && (ctxt.Pkgpath != "" || len(s.R) == 0) {
+		if s.ContentAddressable() {
 			if s.Size <= 8 && len(s.R) == 0 && contentHashSection(s) == 0 {
 				// We can use short hash only for symbols without relocations.
 				// Don't use short hash for symbols that belong in a particular section
@@ -267,7 +320,7 @@ func (ctxt *Link) NumberSyms() {
 			// Assign special index for builtin symbols.
 			// Don't do it when linking against shared libraries, as the runtime
 			// may be in a different library.
-			if i := goobj.BuiltinIdx(rs.Name, int(rs.ABI())); i != -1 {
+			if i := goobj.BuiltinIdx(rs.Name, int(rs.ABI())); i != -1 && !rs.IsLinkname() {
 				rs.PkgIdx = goobj.PkgIdxBuiltin
 				rs.SymIdx = int32(i)
 				rs.Set(AttrIndexed, true)
@@ -325,10 +378,10 @@ func isNonPkgSym(ctxt *Link, s *LSym) bool {
 	return false
 }
 
-// StaticNamePref is the prefix the front end applies to static temporary
+// StaticNamePrefix is the prefix the front end applies to static temporary
 // variables. When turned into LSyms, these can be tagged as static so
 // as to avoid inserting them into the linker's name lookup tables.
-const StaticNamePref = ".stmp_"
+const StaticNamePrefix = ".stmp_"
 
 type traverseFlag uint32
 
@@ -349,6 +402,7 @@ func (ctxt *Link) traverseSyms(flag traverseFlag, fn func(*LSym)) {
 		}
 	}
 	lists := [][]*LSym{ctxt.Text, ctxt.Data}
+	files := ctxt.PosTable.FileTable()
 	for _, list := range lists {
 		for _, s := range list {
 			if flag&traverseDefs != 0 {
@@ -361,14 +415,16 @@ func (ctxt *Link) traverseSyms(flag traverseFlag, fn func(*LSym)) {
 			}
 			if flag&traverseAux != 0 {
 				fnNoNil(s.Gotype)
-				if s.Type == objabi.STEXT {
+				if s.Type.IsText() {
 					f := func(parent *LSym, aux *LSym) {
 						fn(aux)
 					}
-					ctxt.traverseFuncAux(flag, s, f)
+					ctxt.traverseFuncAux(flag, s, f, files)
+				} else if v := s.VarInfo(); v != nil {
+					fnNoNil(v.dwarfInfoSym)
 				}
 			}
-			if flag&traversePcdata != 0 && s.Type == objabi.STEXT {
+			if flag&traversePcdata != 0 && s.Type.IsText() {
 				fi := s.Func().Pcln
 				fnNoNil(fi.Pcsp)
 				fnNoNil(fi.Pcfile)
@@ -382,7 +438,7 @@ func (ctxt *Link) traverseSyms(flag traverseFlag, fn func(*LSym)) {
 	}
 }
 
-func (ctxt *Link) traverseFuncAux(flag traverseFlag, fsym *LSym, fn func(parent *LSym, aux *LSym)) {
+func (ctxt *Link) traverseFuncAux(flag traverseFlag, fsym *LSym, fn func(parent *LSym, aux *LSym), files []string) {
 	fninfo := fsym.Func()
 	pc := &fninfo.Pcln
 	if flag&traverseAux == 0 {
@@ -395,7 +451,6 @@ func (ctxt *Link) traverseFuncAux(flag traverseFlag, fsym *LSym, fn func(parent 
 			fn(fsym, d)
 		}
 	}
-	files := ctxt.PosTable.FileTable()
 	usedFiles := make([]goobj.CUFileIndex, 0, len(pc.UsedFiles))
 	for f := range pc.UsedFiles {
 		usedFiles = append(usedFiles, f)
@@ -410,22 +465,24 @@ func (ctxt *Link) traverseFuncAux(flag traverseFlag, fsym *LSym, fn func(parent 
 		if call.Func != nil {
 			fn(fsym, call.Func)
 		}
-		f, _ := linkgetlineFromPos(ctxt, call.Pos)
-		if filesym := ctxt.Lookup(f); filesym != nil {
-			fn(fsym, filesym)
-		}
 	}
 
-	dwsyms := []*LSym{fninfo.dwarfRangesSym, fninfo.dwarfLocSym, fninfo.dwarfDebugLinesSym, fninfo.dwarfInfoSym}
-	for _, dws := range dwsyms {
-		if dws == nil || dws.Size == 0 {
+	auxsyms := []*LSym{fninfo.dwarfRangesSym, fninfo.dwarfLocSym, fninfo.dwarfDebugLinesSym, fninfo.dwarfInfoSym, fninfo.sehUnwindInfoSym}
+	if wi := fninfo.WasmImport; wi != nil {
+		auxsyms = append(auxsyms, wi.AuxSym)
+	}
+	if we := fninfo.WasmExport; we != nil {
+		auxsyms = append(auxsyms, we.AuxSym)
+	}
+	for _, s := range auxsyms {
+		if s == nil || s.Size == 0 {
 			continue
 		}
-		fn(fsym, dws)
+		fn(fsym, s)
 		if flag&traverseRefs != 0 {
-			for _, r := range dws.R {
+			for _, r := range s.R {
 				if r.Sym != nil {
-					fn(dws, r.Sym)
+					fn(s, r.Sym)
 				}
 			}
 		}
@@ -435,6 +492,7 @@ func (ctxt *Link) traverseFuncAux(flag traverseFlag, fsym *LSym, fn func(parent 
 // Traverse aux symbols, calling fn for each sym/aux pair.
 func (ctxt *Link) traverseAuxSyms(flag traverseFlag, fn func(parent *LSym, aux *LSym)) {
 	lists := [][]*LSym{ctxt.Text, ctxt.Data}
+	files := ctxt.PosTable.FileTable()
 	for _, list := range lists {
 		for _, s := range list {
 			if s.Gotype != nil {
@@ -442,10 +500,11 @@ func (ctxt *Link) traverseAuxSyms(flag traverseFlag, fn func(parent *LSym, aux *
 					fn(s, s.Gotype)
 				}
 			}
-			if s.Type != objabi.STEXT {
-				continue
+			if s.Type.IsText() {
+				ctxt.traverseFuncAux(flag, s, fn, files)
+			} else if v := s.VarInfo(); v != nil && v.dwarfInfoSym != nil {
+				fn(s, v.dwarfInfoSym)
 			}
-			ctxt.traverseFuncAux(flag, s, fn)
 		}
 	}
 }

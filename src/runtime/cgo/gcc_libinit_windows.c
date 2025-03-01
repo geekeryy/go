@@ -2,17 +2,27 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build cgo
+#ifdef __CYGWIN__
+#error "don't use the cygwin compiler to build native Windows programs; use MinGW instead"
+#endif
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <process.h>
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
 
 #include "libcgo.h"
+#include "libcgo_windows.h"
+
+// Ensure there's one symbol marked __declspec(dllexport).
+// If there are no exported symbols, the unfortunate behavior of
+// the binutils linker is to also strip the relocations table,
+// resulting in non-PIE binary. The other option is the
+// --export-all-symbols flag, but we don't need to export all symbols
+// and this may overflow the export table (#40795).
+// See https://sourceware.org/bugzilla/show_bug.cgi?id=19011
+__declspec(dllexport) int _cgo_dummy_export;
 
 static volatile LONG runtime_init_once_gate = 0;
 static volatile LONG runtime_init_once_done = 0;
@@ -21,6 +31,9 @@ static CRITICAL_SECTION runtime_init_cs;
 
 static HANDLE runtime_init_wait;
 static int runtime_init_done;
+
+uintptr_t x_cgo_pthread_key_created;
+void (*x_crosscall2_ptr)(void (*fn)(void *), void *, int, size_t);
 
 // Pre-initialize the runtime synchronization objects
 void
@@ -52,20 +65,16 @@ _cgo_maybe_run_preinit() {
 }
 
 void
-x_cgo_sys_thread_create(void (*func)(void*), void* arg) {
-	uintptr_t thandle;
-
-	thandle = _beginthread(func, 0, arg);
-	if(thandle == -1) {
-		fprintf(stderr, "runtime: failed to create new OS thread (%d)\n", errno);
-		abort();
-	}
+x_cgo_sys_thread_create(unsigned long (__stdcall *func)(void*), void* arg) {
+	_cgo_beginthread(func, arg);
 }
 
 int
 _cgo_is_runtime_initialized() {
+	 int status;
+
 	 EnterCriticalSection(&runtime_init_cs);
-	 int status = runtime_init_done;
+	 status = runtime_init_done;
 	 LeaveCriticalSection(&runtime_init_cs);
 	 return status;
 }
@@ -87,6 +96,12 @@ _cgo_wait_runtime_init_done(void) {
 		return arg.Context;
 	}
 	return 0;
+}
+
+// Should not be used since x_cgo_pthread_key_created will always be zero.
+void x_cgo_bindm(void* dummy) {
+	fprintf(stderr, "unexpected cgo_bindm on Windows\n");
+	abort();
 }
 
 void
@@ -122,4 +137,27 @@ void (*(_cgo_get_context_function(void)))(struct context_arg*) {
 	ret = cgo_context_function;
 	LeaveCriticalSection(&runtime_init_cs);
 	return ret;
+}
+
+void _cgo_beginthread(unsigned long (__stdcall *func)(void*), void* arg) {
+	int tries;
+	HANDLE thandle;
+
+	for (tries = 0; tries < 20; tries++) {
+		thandle = CreateThread(NULL, 0, func, arg, 0, NULL);
+		if (thandle == 0 && GetLastError() == ERROR_NOT_ENOUGH_MEMORY) {
+			// "Insufficient resources", try again in a bit.
+			//
+			// Note that the first Sleep(0) is a yield.
+			Sleep(tries); // milliseconds
+			continue;
+		} else if (thandle == 0) {
+			break;
+		}
+		CloseHandle(thandle);
+		return; // Success!
+	}
+
+	fprintf(stderr, "runtime: failed to create new OS thread (%lu)\n", GetLastError());
+	abort();
 }

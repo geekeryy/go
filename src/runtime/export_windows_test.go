@@ -6,12 +6,14 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/runtime/sys"
+	"unsafe"
+)
 
 const MaxArgs = maxArgs
 
 var (
-	TestingWER              = &testingWER
 	OsYield                 = osyield
 	TimeBeginPeriodRetValue = &timeBeginPeriodRetValue
 )
@@ -22,6 +24,18 @@ func NumberOfProcessors() int32 {
 	return int32(info.dwnumberofprocessors)
 }
 
-func LoadLibraryExStatus() (useEx, haveEx, haveFlags bool) {
-	return useLoadLibraryEx, _LoadLibraryExW != nil, _AddDllDirectory != nil
+type ContextStub struct {
+	context
+}
+
+func (c ContextStub) GetPC() uintptr {
+	return c.ip()
+}
+
+func NewContextStub() *ContextStub {
+	var ctx context
+	ctx.set_ip(sys.GetCallerPC())
+	ctx.set_sp(sys.GetCallerSP())
+	ctx.set_fp(getcallerfp())
+	return &ContextStub{ctx}
 }

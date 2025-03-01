@@ -43,7 +43,6 @@ type pair struct{ x, y int }
 // Second, the name is frequently interpreted as meaning that you have
 // to wait longer (to be patient) for the diff, meaning that it is a slower algorithm,
 // when in fact the algorithm is faster than the standard one.
-//
 func Diff(oldName string, old []byte, newName string, new []byte) []byte {
 	if bytes.Equal(old, new) {
 		return nil
@@ -75,9 +74,9 @@ func Diff(oldName string, old []byte, newName string, new []byte) []byte {
 			continue
 		}
 
-		// Expand matching lines as far possible,
+		// Expand matching lines as far as possible,
 		// establishing that x[start.x:end.x] == y[start.y:end.y].
-		// Note that on the first (or last) iteration we may (or definitey do)
+		// Note that on the first (or last) iteration we may (or definitely do)
 		// have an empty match: start.x==end.x and start.y==end.y.
 		start := m
 		for start.x > done.x && start.y > done.y && x[start.x-1] == y[start.y-1] {
