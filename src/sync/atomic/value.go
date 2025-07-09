@@ -56,6 +56,7 @@ func (v *Value) Store(val any) {
 			// Attempt to start first store.
 			// Disable preemption so that other goroutines can use
 			// active spin wait to wait for completion.
+			// 禁用抢占，自旋等待
 			runtime_procPin()
 			if !CompareAndSwapPointer(&vp.typ, nil, unsafe.Pointer(&firstStoreInProgress)) {
 				runtime_procUnpin()
