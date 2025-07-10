@@ -1111,6 +1111,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	if isH2Upgrade {
 		w.closeAfterReply = true
 	}
+	// 将chunkWriter与response建立双向引用
 	w.cw.res = w
 	w.w = newBufioWriterSize(&w.cw, bufferBeforeChunkingSize)
 	return w, nil

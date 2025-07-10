@@ -38,6 +38,10 @@ type (
 	renamedComplex128 complex128
 )
 
+func TestFmt(t *testing.T) {
+	Println("hello world")
+}
+
 func TestFmtInterface(t *testing.T) {
 	var i1 any
 	i1 = "abc"
