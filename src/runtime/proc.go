@@ -7150,7 +7150,7 @@ func setMaxThreads(in int) (out int) {
 //
 //go:linkname procPin
 //go:nosplit
-func procPin() int {
+func procPin() int { // 禁止抢占
 	gp := getg()
 	mp := gp.m
 
@@ -7170,7 +7170,7 @@ func procPin() int {
 //
 //go:linkname procUnpin
 //go:nosplit
-func procUnpin() {
+func procUnpin() { // 启用抢占
 	gp := getg()
 	gp.m.locks--
 }

@@ -579,6 +579,7 @@ func notifyListWait(l *notifyList, t uint32) {
 	}
 
 	// Enqueue itself.
+	// 获取一个sudog结构体，并关联当前goroutine，用于唤醒
 	s := acquireSudog()
 	s.g = getg()
 	s.ticket = t
@@ -593,11 +594,14 @@ func notifyListWait(l *notifyList, t uint32) {
 	} else {
 		l.tail.next = s
 	}
+	// 将sudog添加到等待队列队尾
 	l.tail = s
+	// 释放锁并挂起当前goroutine，等待被唤醒
 	goparkunlock(&l.lock, waitReasonSyncCondWait, traceBlockCondWait, 3)
 	if t0 != 0 {
 		blockevent(s.releasetime-t0, 2)
 	}
+	// 释放sudog，回收资源
 	releaseSudog(s)
 }
 

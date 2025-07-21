@@ -59,6 +59,7 @@ func (v *Value) Store(val any) {
 			// 禁用抢占，自旋等待
 			runtime_procPin()
 			if !CompareAndSwapPointer(&vp.typ, nil, unsafe.Pointer(&firstStoreInProgress)) {
+				// 启用抢占
 				runtime_procUnpin()
 				continue
 			}

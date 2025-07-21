@@ -66,9 +66,9 @@ func NewCond(l Locker) *Cond {
 //	c.L.Unlock()
 func (c *Cond) Wait() {
 	c.checker.check()
-	t := runtime_notifyListAdd(&c.notify)
+	t := runtime_notifyListAdd(&c.notify) // 添加到等待队列
 	c.L.Unlock()
-	runtime_notifyListWait(&c.notify, t)
+	runtime_notifyListWait(&c.notify, t) // 等待唤醒
 	c.L.Lock()
 }
 
@@ -81,7 +81,7 @@ func (c *Cond) Wait() {
 // are attempting to lock c.L, they may be awoken before a "waiting" goroutine.
 func (c *Cond) Signal() {
 	c.checker.check()
-	runtime_notifyListNotifyOne(&c.notify)
+	runtime_notifyListNotifyOne(&c.notify) // 唤醒一个等待者
 }
 
 // Broadcast wakes all goroutines waiting on c.
@@ -90,7 +90,7 @@ func (c *Cond) Signal() {
 // during the call.
 func (c *Cond) Broadcast() {
 	c.checker.check()
-	runtime_notifyListNotifyAll(&c.notify)
+	runtime_notifyListNotifyAll(&c.notify) // 唤醒所有等待者
 }
 
 // copyChecker holds back pointer to itself to detect object copying.

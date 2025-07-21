@@ -66,6 +66,7 @@ func (wg *WaitGroup) Add(delta int) {
 	if w != 0 && delta > 0 && v == int32(delta) {
 		panic("sync: WaitGroup misuse: Add called concurrently with Wait")
 	}
+	// 如果计数器大于0，或者没有等待者，此时不需要唤醒等待者，直接返回
 	if v > 0 || w == 0 {
 		return
 	}
@@ -79,6 +80,7 @@ func (wg *WaitGroup) Add(delta int) {
 	}
 	// Reset waiters count to 0.
 	wg.state.Store(0)
+	// 计数器为0，唤醒所有等待者
 	for ; w != 0; w-- {
 		runtime_Semrelease(&wg.sema, false, 0)
 	}
@@ -115,6 +117,7 @@ func (wg *WaitGroup) Wait() {
 				// otherwise concurrent Waits will race with each other.
 				race.Write(unsafe.Pointer(&wg.sema))
 			}
+			// 使用&wg.sema创建一个队列，将当前goroutine放入队列，挂起当前goroutine，等待被唤醒
 			runtime_SemacquireWaitGroup(&wg.sema)
 			if wg.state.Load() != 0 {
 				panic("sync: WaitGroup is reused before previous Wait has returned")
