@@ -18,8 +18,8 @@ import (
 //
 // See package [sync.Mutex] documentation.
 type Mutex struct {
-	state int32
-	sema  uint32
+	state int32 // 高29位表示等待者数量，低3位表示饥饿模式、唤醒标志、锁状态
+	sema  uint32 // 信号量，用于创建唯一等待队列
 }
 
 const (
@@ -101,7 +101,7 @@ func (m *Mutex) lockSlow() {
 	for {
 		// Don't spin in starvation mode, ownership is handed off to waiters
 		// so we won't be able to acquire the mutex anyway.
-		// 如果锁被占用，未在饥饿模式下，并且当前goroutine可以自旋，则进行自旋
+		// 如果锁被占用，且未在饥饿模式下，并且当前goroutine可以自旋，则进行自旋
 		if old&(mutexLocked|mutexStarving) == mutexLocked && runtime_canSpin(iter) {
 			// Active spinning makes sense.
 			// Try to set mutexWoken flag to inform Unlock
@@ -118,7 +118,7 @@ func (m *Mutex) lockSlow() {
 		new := old
 		// Don't try to acquire starving mutex, new arriving goroutines must queue.
 		// 不要尝试获取饥饿互斥锁，新到达的goroutine必须排队。
-		// 如果锁处于饥饿模式则不加锁，直接排队
+		// 如果锁处于饥饿模式，新到达的goroutine则不加锁，直接排队
 		if old&mutexStarving == 0 {
 			new |= mutexLocked
 		}

@@ -39,6 +39,7 @@ import (
 // BenchmarkSemTable/OneAddrCollision/* for a benchmark that exercises this.
 type semaRoot struct {
 	lock  mutex
+	// 平衡树，用于快速查找等待者
 	treap *sudog        // root of balanced tree of unique waiters.
 	nwait atomic.Uint32 // Number of waiters. Read w/o the lock.
 }
@@ -54,6 +55,8 @@ type semTable [semTabSize]struct {
 }
 
 func (t *semTable) rootFor(addr *uint32) *semaRoot {
+	// 根据Go内存对齐规则，uint32需要4字节对齐，这意味着uint32的地址一定是4的倍数，因此低2位始终为0
+	// 因为这里的addr是锁的sema字段，它之前还有一个4字节state字段，所以addr的地址低三位一定是100
 	return &t[(uintptr(unsafe.Pointer(addr))>>3)%semTabSize].root
 }
 
@@ -302,6 +305,7 @@ func (root *semaRoot) queue(addr *uint32, s *sudog, lifo bool) {
 	var last *sudog
 	pt := &root.treap
 	for t := *pt; t != nil; t = *pt {
+		// 找到同一把锁的等待队列
 		if t.elem == unsafe.Pointer(addr) {
 			// Already have addr in list.
 			if lifo {

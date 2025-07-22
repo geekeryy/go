@@ -40,11 +40,13 @@ type RWMutex struct {
 	w           Mutex        // held if there are pending writers
 	writerSem   uint32       // semaphore for writers to wait for completing readers
 	readerSem   uint32       // semaphore for readers to wait for completing writers
+	// 读锁计数器
 	readerCount atomic.Int32 // number of pending readers
+	// 写锁进入加锁流程时，需要等待的读锁释放的goroutine数量
 	readerWait  atomic.Int32 // number of departing readers
 }
 
-const rwmutexMaxReaders = 1 << 30
+const rwmutexMaxReaders = 1 << 30 // 读锁计数器最大值 
 
 // Happens-before relationships are indicated to the race detector via:
 // - Unlock  -> Lock:  readerSem
@@ -69,6 +71,7 @@ func (rw *RWMutex) RLock() {
 		race.Read(unsafe.Pointer(&rw.w))
 		race.Disable()
 	}
+	// 一个写锁正在加锁流程，阻塞等待
 	if rw.readerCount.Add(1) < 0 {
 		// A writer is pending, wait for it.
 		runtime_SemacquireRWMutexR(&rw.readerSem, false, 0)
@@ -117,6 +120,7 @@ func (rw *RWMutex) RUnlock() {
 		race.ReleaseMerge(unsafe.Pointer(&rw.writerSem))
 		race.Disable()
 	}
+	// 一个写锁正在加锁流程中，最后一个读锁释放，唤醒写锁
 	if r := rw.readerCount.Add(-1); r < 0 {
 		// Outlined slow-path to allow the fast-path to be inlined
 		rw.rUnlockSlow(r)
@@ -134,6 +138,7 @@ func (rw *RWMutex) rUnlockSlow(r int32) {
 	// A writer is pending.
 	if rw.readerWait.Add(-1) == 0 {
 		// The last reader unblocks the writer.
+		// 最后一个读锁释放，唤醒写锁
 		runtime_Semrelease(&rw.writerSem, false, 1)
 	}
 }
@@ -149,9 +154,12 @@ func (rw *RWMutex) Lock() {
 	// First, resolve competition with other writers.
 	rw.w.Lock()
 	// Announce to readers there is a pending writer.
+	// 减去读锁计数器最大值，变为负数，阻止后续读锁
 	r := rw.readerCount.Add(-rwmutexMaxReaders) + rwmutexMaxReaders
 	// Wait for active readers.
+	// 将阻止读锁时刻的读锁计数器的值，赋值给等待计数器
 	if r != 0 && rw.readerWait.Add(r) != 0 {
+		// 阻塞等待最后一个读锁释放
 		runtime_SemacquireRWMutex(&rw.writerSem, false, 0)
 	}
 	if race.Enabled {
@@ -206,12 +214,14 @@ func (rw *RWMutex) Unlock() {
 	}
 
 	// Announce to readers there is no active writer.
+	// 允许读锁继续加锁
 	r := rw.readerCount.Add(rwmutexMaxReaders)
 	if r >= rwmutexMaxReaders {
 		race.Enable()
 		fatal("sync: Unlock of unlocked RWMutex")
 	}
 	// Unblock blocked readers, if any.
+	// 唤醒所有等待读锁的goroutine
 	for i := 0; i < int(r); i++ {
 		runtime_Semrelease(&rw.readerSem, false, 0)
 	}
